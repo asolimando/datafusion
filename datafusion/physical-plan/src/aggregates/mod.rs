@@ -1079,10 +1079,12 @@ impl AggregateExec {
             _ => {
                 // When the input row count is 1, we can adopt that statistic keeping its reliability.
                 // When it is larger than 1, we degrade the precision since it may decrease after aggregation.
+                // If we have NDV for group-by columns, use that as a better estimate.
                 let num_rows = if let Some(value) = child_statistics.num_rows.get_value()
                 {
                     if *value > 1 {
-                        child_statistics.num_rows.to_inexact()
+                        let ndv_estimate = self.estimate_groups_from_ndv(child_statistics);
+                        ndv_estimate.unwrap_or_else(|| child_statistics.num_rows.to_inexact())
                     } else if *value == 0 {
                         child_statistics.num_rows
                     } else {
@@ -1110,6 +1112,45 @@ impl AggregateExec {
                 })
             }
         }
+    }
+
+    /// Estimate output groups using NDV of group-by columns
+    fn estimate_groups_from_ndv(
+        &self,
+        child_statistics: &Statistics,
+    ) -> Option<Precision<usize>> {
+        if self.group_by.expr.is_empty() {
+            return None;
+        }
+
+        let mut ndv_product: Option<usize> = None;
+        for (expr, _) in self.group_by.expr.iter() {
+            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                let col_stats = &child_statistics.column_statistics[col.index()];
+                if let Some(&ndv) = col_stats.distinct_count.get_value() {
+                    if ndv > 0 {
+                        ndv_product = Some(match ndv_product {
+                            Some(prev) => prev.saturating_mul(ndv),
+                            None => ndv,
+                        });
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        ndv_product.map(|product| {
+            let input_rows = child_statistics.num_rows.get_value().copied();
+            let estimate = match input_rows {
+                Some(rows) => product.min(rows),
+                None => product,
+            };
+            let grouping_set_num = self.group_by.groups.len();
+            Precision::Inexact(estimate * grouping_set_num)
+        })
     }
 
     /// Check if dynamic filter is possible for the current plan node.

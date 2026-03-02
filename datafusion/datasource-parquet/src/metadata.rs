@@ -293,6 +293,8 @@ impl<'a> DFParquetMetadata<'a> {
                     vec![Precision::Absent; logical_file_schema.fields().len()];
                 let mut column_byte_sizes =
                     vec![Precision::Absent; logical_file_schema.fields().len()];
+                let mut distinct_counts_array =
+                    vec![Precision::Absent; logical_file_schema.fields().len()];
                 let mut is_max_value_exact =
                     vec![Some(true); logical_file_schema.fields().len()];
                 let mut is_min_value_exact =
@@ -311,6 +313,7 @@ impl<'a> DFParquetMetadata<'a> {
                                 is_min_value_exact: &mut is_min_value_exact,
                                 is_max_value_exact: &mut is_max_value_exact,
                                 column_byte_sizes: &mut column_byte_sizes,
+                                distinct_counts_array: &mut distinct_counts_array,
                             };
                             summarize_min_max_null_counts(
                                 file_metadata.schema_descr(),
@@ -338,6 +341,7 @@ impl<'a> DFParquetMetadata<'a> {
                     &mut is_max_value_exact,
                     &mut is_min_value_exact,
                     &column_byte_sizes,
+                    &distinct_counts_array,
                 )
             } else {
                 // Record column sizes
@@ -419,6 +423,7 @@ fn get_col_stats(
     is_max_value_exact: &mut [Option<bool>],
     is_min_value_exact: &mut [Option<bool>],
     column_byte_sizes: &[Precision<usize>],
+    distinct_counts: &[Precision<usize>],
 ) -> Vec<ColumnStatistics> {
     (0..schema.fields().len())
         .map(|i| {
@@ -451,7 +456,7 @@ fn get_col_stats(
                 max_value: max_value.unwrap_or(Precision::Absent),
                 min_value: min_value.unwrap_or(Precision::Absent),
                 sum_value: Precision::Absent,
-                distinct_count: Precision::Absent,
+                distinct_count: distinct_counts[i],
                 byte_size: column_byte_sizes[i],
             }
         })
@@ -466,6 +471,7 @@ struct StatisticsAccumulators<'a> {
     is_min_value_exact: &'a mut [Option<bool>],
     is_max_value_exact: &'a mut [Option<bool>],
     column_byte_sizes: &'a mut [Precision<usize>],
+    distinct_counts_array: &'a mut [Precision<usize>],
 }
 
 fn summarize_min_max_null_counts(
@@ -540,6 +546,33 @@ fn summarize_min_max_null_counts(
         logical_file_schema.field(logical_schema_index).name(),
     )
     .map(|(idx, _)| idx);
+
+    // Extract distinct counts from row group column statistics
+    accumulators.distinct_counts_array[logical_schema_index] =
+        if let Some(parquet_idx) = parquet_index {
+            let distinct_counts: Vec<u64> = row_groups_metadata
+                .iter()
+                .filter_map(|rg| {
+                    rg.columns()
+                        .get(parquet_idx)
+                        .and_then(|col| col.statistics())
+                        .and_then(|stats| stats.distinct_count_opt())
+                })
+                .collect();
+
+            if distinct_counts.is_empty() {
+                Precision::Absent
+            } else if distinct_counts.len() == 1 {
+                Precision::Exact(distinct_counts[0] as usize)
+            } else {
+                match distinct_counts.iter().max() {
+                    Some(&max_ndv) => Precision::Inexact(max_ndv as usize),
+                    None => Precision::Absent,
+                }
+            }
+        } else {
+            Precision::Absent
+        };
 
     let arrow_field = logical_file_schema.field(logical_schema_index);
     accumulators.column_byte_sizes[logical_schema_index] = compute_arrow_column_size(
