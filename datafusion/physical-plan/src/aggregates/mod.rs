@@ -1036,10 +1036,24 @@ impl AggregateExec {
         &self.input_order_mode
     }
 
+    /// Compute an upper bound on the number of output groups from the NDVs
+    /// of group-by columns. Returns `None` if any group-by expression is not
+    /// a simple column reference or lacks a known NDV.
+    fn compute_group_by_ndv_bound(&self, stats: &Statistics) -> Option<usize> {
+        let mut product: usize = 1;
+        for (expr, _) in &self.group_by.expr {
+            let col = expr.as_any().downcast_ref::<Column>()?;
+            let ndv = stats.column_statistics[col.index()]
+                .distinct_count
+                .get_value()?;
+            product = product.checked_mul(*ndv)?;
+        }
+        // Account for grouping sets (ROLLUP/CUBE generate multiple grouping combinations)
+        let grouping_set_num = self.group_by.groups.len();
+        product.checked_mul(grouping_set_num)
+    }
+
     fn statistics_inner(&self, child_statistics: &Statistics) -> Result<Statistics> {
-        // TODO stats: group expressions:
-        // - once expressions will be able to compute their own stats, use it here
-        // - case where we group by on a column for which with have the `distinct` stat
         // TODO stats: aggr expression:
         // - aggregations sometimes also preserve invariants such as min, max...
 
@@ -1049,15 +1063,14 @@ impl AggregateExec {
 
             for (idx, (expr, _)) in self.group_by.expr.iter().enumerate() {
                 if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                    column_statistics[idx].max_value = child_statistics.column_statistics
-                        [col.index()]
-                    .max_value
-                    .clone();
-
-                    column_statistics[idx].min_value = child_statistics.column_statistics
-                        [col.index()]
-                    .min_value
-                    .clone();
+                    let input_col_stats =
+                        &child_statistics.column_statistics[col.index()];
+                    column_statistics[idx].max_value =
+                        input_col_stats.max_value.clone();
+                    column_statistics[idx].min_value =
+                        input_col_stats.min_value.clone();
+                    column_statistics[idx].distinct_count =
+                        input_col_stats.distinct_count.clone();
                 }
             }
 
@@ -1082,7 +1095,15 @@ impl AggregateExec {
                 let num_rows = if let Some(value) = child_statistics.num_rows.get_value()
                 {
                     if *value > 1 {
-                        child_statistics.num_rows.to_inexact()
+                        // Use NDV product of group-by columns as upper bound
+                        let ndv_bound =
+                            self.compute_group_by_ndv_bound(child_statistics);
+                        match ndv_bound {
+                            Some(bound) => {
+                                Precision::Inexact((*value).min(bound))
+                            }
+                            None => child_statistics.num_rows.to_inexact(),
+                        }
                     } else if *value == 0 {
                         child_statistics.num_rows
                     } else {
@@ -4100,6 +4121,73 @@ mod tests {
             | 3 | 90.0   |
             +---+--------+
         ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_statistics_ndv_bound() -> Result<()> {
+        use crate::test::exec::StatisticsExec;
+        use datafusion_common::ColumnStatistics;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Float64, false),
+        ]));
+
+        // Input: 10000 rows, GROUP BY a (NDV=10), b (NDV=20)
+        // NDV product = 10 * 20 = 200, so output should be min(10000, 200) = 200
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(10000),
+                total_byte_size: Precision::Inexact(40000),
+                column_statistics: vec![
+                    ColumnStatistics {
+                        distinct_count: Precision::Inexact(10),
+                        ..Default::default()
+                    },
+                    ColumnStatistics {
+                        distinct_count: Precision::Inexact(20),
+                        ..Default::default()
+                    },
+                    ColumnStatistics::new_unknown(),
+                ],
+            },
+            (*schema).clone(),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let group_by = PhysicalGroupBy::new_single(vec![
+            (col("a", &schema)?, "a".to_string()),
+            (col("b", &schema)?, "b".to_string()),
+        ]);
+
+        let agg = Arc::new(AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by,
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("c", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("COUNT(c)")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?);
+
+        let stats = agg.partition_statistics(None)?;
+        // NDV product (10 * 20 = 200) is less than input rows (10000)
+        assert_eq!(stats.num_rows, Precision::Inexact(200));
+        // NDV should be propagated to the group-by output columns
+        assert_eq!(
+            stats.column_statistics[0].distinct_count,
+            Precision::Inexact(10)
+        );
+        assert_eq!(
+            stats.column_statistics[1].distinct_count,
+            Precision::Inexact(20)
+        );
 
         Ok(())
     }

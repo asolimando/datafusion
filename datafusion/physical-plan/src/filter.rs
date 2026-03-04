@@ -339,6 +339,7 @@ impl FilterExec {
         let column_statistics = collect_new_statistics(
             &input_stats.column_statistics,
             analysis_ctx.boundaries,
+            num_rows.get_value().copied(),
         );
         Ok(Statistics {
             num_rows,
@@ -759,6 +760,7 @@ impl EmbeddedProjection for FilterExec {
 fn collect_new_statistics(
     input_column_stats: &[ColumnStatistics],
     analysis_boundaries: Vec<ExprBoundaries>,
+    filtered_num_rows: Option<usize>,
 ) -> Vec<ColumnStatistics> {
     analysis_boundaries
         .into_iter()
@@ -789,12 +791,19 @@ fn collect_new_statistics(
                 } else {
                     (Precision::Inexact(lower), Precision::Inexact(upper))
                 };
+                // NDV can never exceed the number of rows after filtering
+                let capped_distinct_count = match filtered_num_rows {
+                    Some(rows) => distinct_count
+                        .to_inexact()
+                        .min(&Precision::Inexact(rows)),
+                    None => distinct_count.to_inexact(),
+                };
                 ColumnStatistics {
                     null_count: input_column_stats[idx].null_count.to_inexact(),
                     max_value,
                     min_value,
                     sum_value: Precision::Absent,
-                    distinct_count: distinct_count.to_inexact(),
+                    distinct_count: capped_distinct_count,
                     byte_size: input_column_stats[idx].byte_size,
                 }
             },
@@ -2064,6 +2073,43 @@ mod tests {
              from output schema (c@0) to input schema (c@2)"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_ndv_capped_at_row_count() -> Result<()> {
+        // Table: a: min=1, max=100, distinct_count=80, 100 rows
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(100),
+                total_byte_size: Precision::Inexact(400),
+                column_statistics: vec![ColumnStatistics {
+                    min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
+                    max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
+                    distinct_count: Precision::Inexact(80),
+                    ..Default::default()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        // a <= 10 => ~10 rows out of 100
+        let predicate: Arc<dyn PhysicalExpr> =
+            binary(col("a", &schema)?, Operator::LtEq, lit(10i32), &schema)?;
+
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics = filter.partition_statistics(None)?;
+        // Filter estimates ~10 rows (selectivity = 10/100)
+        assert_eq!(statistics.num_rows, Precision::Inexact(10));
+        // NDV should be capped at the filtered row count (10), not the original 80
+        let ndv = &statistics.column_statistics[0].distinct_count;
+        assert!(
+            ndv.get_value().copied() <= Some(10),
+            "Expected NDV <= 10 (filtered row count), got {ndv:?}"
+        );
         Ok(())
     }
 }
