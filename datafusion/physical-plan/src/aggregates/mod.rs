@@ -1057,7 +1057,7 @@ impl AggregateExec {
         // TODO stats: aggr expression:
         // - aggregations sometimes also preserve invariants such as min, max...
 
-        let column_statistics = {
+        let mut column_statistics = {
             // self.schema: [<group by exprs>, <aggregate exprs>]
             let mut column_statistics = Statistics::unknown_column(&self.schema());
 
@@ -1123,6 +1123,21 @@ impl AggregateExec {
                             .map(|&bytes| Precision::Inexact(bytes))
                     })
                     .unwrap_or(Precision::Absent);
+
+                // Cap group-by column NDVs at the estimated output num_rows,
+                // since a column can't have more distinct values than rows
+                if let Some(&output_rows) = num_rows.get_value() {
+                    let cap = Precision::Inexact(output_rows);
+                    for cs in column_statistics.iter_mut() {
+                        if matches!(
+                            cs.distinct_count,
+                            Precision::Exact(_) | Precision::Inexact(_)
+                        ) {
+                            cs.distinct_count =
+                                cs.distinct_count.min(&cap).to_inexact();
+                        }
+                    }
+                }
 
                 Ok(Statistics {
                     num_rows,
