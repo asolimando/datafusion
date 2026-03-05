@@ -515,31 +515,17 @@ fn estimate_join_cardinality(
                 _ => unreachable!(),
             };
 
-            let num_rows = *cardinality.get_value()?;
-            let num_rows_cap = Precision::Inexact(num_rows);
-
-            // Combine column statistics from both sides, capping NDV at
-            // the join output row count (a column can't have more distinct
-            // values than rows in the output)
-            let column_statistics: Vec<ColumnStatistics> = left_stats
-                .column_statistics
-                .into_iter()
-                .chain(right_stats.column_statistics)
-                .map(|mut cs| {
-                    if matches!(
-                        cs.distinct_count,
-                        Precision::Exact(_) | Precision::Inexact(_)
-                    ) {
-                        cs.distinct_count =
-                            cs.distinct_count.min(&num_rows_cap).to_inexact();
-                    }
-                    cs
-                })
-                .collect();
-
             Some(PartialJoinStatistics {
-                num_rows,
-                column_statistics,
+                num_rows: *cardinality.get_value()?,
+                // We don't do anything specific here, just combine the existing
+                // statistics which might yield subpar results (although it is
+                // true, esp regarding min/max). For a better estimation, we need
+                // filter selectivity analysis first.
+                column_statistics: left_stats
+                    .column_statistics
+                    .into_iter()
+                    .chain(right_stats.column_statistics)
+                    .collect(),
             })
         }
 
@@ -2367,30 +2353,9 @@ mod tests {
                 partial_join_stats.clone().map(|s| Inexact(s.num_rows)),
                 expected_cardinality.clone()
             );
-            // Column NDVs are capped at the join output num_rows
-            let expected_col_stats =
-                expected_cardinality.clone().map(|card| {
-                    let cap_val = *card.get_value().unwrap();
-                    [left_col_stats.clone(), right_col_stats.clone()]
-                        .concat()
-                        .into_iter()
-                        .map(|mut cs| {
-                            if matches!(
-                                cs.distinct_count,
-                                Inexact(_) | Exact(_)
-                            ) {
-                                cs.distinct_count = cs
-                                    .distinct_count
-                                    .min(&Inexact(cap_val))
-                                    .to_inexact();
-                            }
-                            cs
-                        })
-                        .collect::<Vec<_>>()
-                });
             assert_eq!(
                 partial_join_stats.map(|s| s.column_statistics),
-                expected_col_stats
+                expected_cardinality.map(|_| [left_col_stats, right_col_stats].concat())
             );
         }
         Ok(())
@@ -2475,17 +2440,11 @@ mod tests {
         //   y: min=0, max=100, distinct=None
         //
         // Join on a=c, b=d (ignore x/y)
-        // Note: right d has NDV=2500, but max_distinct_count caps it at
-        // num_rows=2000. So max(NDV(b),NDV(d)) = max(500,2000) = 2000.
-        // Inner cardinality = (1000*2000)/2000 = 1000.
-        // Left = max(1000, 1000) = 1000.
-        // Right = max(1000, 2000) = 2000.
-        // Full = max(1000,1000) + max(1000,2000) - 1000 = 2000.
         let cases = vec![
-            (JoinType::Inner, 1000),
+            (JoinType::Inner, 800),
             (JoinType::Left, 1000),
             (JoinType::Right, 2000),
-            (JoinType::Full, 2000),
+            (JoinType::Full, 2200),
         ];
 
         let left_col_stats = vec![
@@ -2520,28 +2479,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(partial_join_stats.num_rows, expected_num_rows);
-
-            // Column NDVs are capped at the join output num_rows
-            let expected_col_stats: Vec<ColumnStatistics> = left_col_stats
-                .iter()
-                .chain(right_col_stats.iter())
-                .map(|cs| {
-                    let mut cs = cs.clone();
-                    if matches!(
-                        cs.distinct_count,
-                        Inexact(_) | Exact(_)
-                    ) {
-                        cs.distinct_count = cs
-                            .distinct_count
-                            .min(&Inexact(expected_num_rows))
-                            .to_inexact();
-                    }
-                    cs
-                })
-                .collect();
             assert_eq!(
                 partial_join_stats.column_statistics,
-                expected_col_stats
+                [left_col_stats.clone(), right_col_stats.clone()].concat()
             );
         }
 
@@ -2610,28 +2550,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(partial_join_stats.num_rows, expected_num_rows);
-
-            // Column NDVs are capped at the join output num_rows
-            let expected_col_stats: Vec<ColumnStatistics> = left_col_stats
-                .iter()
-                .chain(right_col_stats.iter())
-                .map(|cs| {
-                    let mut cs = cs.clone();
-                    if matches!(
-                        cs.distinct_count,
-                        Inexact(_) | Exact(_)
-                    ) {
-                        cs.distinct_count = cs
-                            .distinct_count
-                            .min(&Inexact(expected_num_rows))
-                            .to_inexact();
-                    }
-                    cs
-                })
-                .collect();
             assert_eq!(
                 partial_join_stats.column_statistics,
-                expected_col_stats
+                [left_col_stats.clone(), right_col_stats.clone()].concat()
             );
         }
 
