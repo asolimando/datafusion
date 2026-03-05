@@ -786,17 +786,23 @@ fn collect_new_statistics(
                     };
                 };
                 let (lower, upper) = interval.into_bounds();
-                let (min_value, max_value) = if lower.eq(&upper) {
-                    (Precision::Exact(lower), Precision::Exact(upper))
+                let (min_value, max_value, is_single_value) = if lower.eq(&upper) {
+                    (Precision::Exact(lower), Precision::Exact(upper), true)
                 } else {
-                    (Precision::Inexact(lower), Precision::Inexact(upper))
+                    (Precision::Inexact(lower), Precision::Inexact(upper), false)
                 };
-                // NDV can never exceed the number of rows after filtering
-                let capped_distinct_count = match filtered_num_rows {
-                    Some(rows) => distinct_count
-                        .to_inexact()
-                        .min(&Precision::Inexact(rows)),
-                    None => distinct_count.to_inexact(),
+                // When the interval collapses to a single value (equality
+                // predicate), the column has exactly 1 distinct value.
+                // Otherwise, cap NDV at the filtered row count.
+                let capped_distinct_count = if is_single_value {
+                    Precision::Exact(1)
+                } else {
+                    match filtered_num_rows {
+                        Some(rows) => distinct_count
+                            .to_inexact()
+                            .min(&Precision::Inexact(rows)),
+                        None => distinct_count.to_inexact(),
+                    }
                 };
                 ColumnStatistics {
                     null_count: input_column_stats[idx].null_count.to_inexact(),
