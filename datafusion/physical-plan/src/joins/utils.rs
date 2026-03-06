@@ -485,20 +485,28 @@ fn estimate_join_cardinality(
         })
         .unzip::<_, _, Vec<_>, Vec<_>>();
 
+    // Closure to compute inner-join cardinality, reusable across join types
+    let inner_join_card = |left_num_rows: Precision<usize>,
+                           right_num_rows: Precision<usize>|
+     -> Option<Precision<usize>> {
+        estimate_inner_join_cardinality(
+            Statistics {
+                num_rows: left_num_rows,
+                total_byte_size: Precision::Absent,
+                column_statistics: left_col_stats.clone(),
+            },
+            Statistics {
+                num_rows: right_num_rows,
+                total_byte_size: Precision::Absent,
+                column_statistics: right_col_stats.clone(),
+            },
+        )
+    };
+
     match join_type {
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-            let ij_cardinality = estimate_inner_join_cardinality(
-                Statistics {
-                    num_rows: left_stats.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: left_col_stats,
-                },
-                Statistics {
-                    num_rows: right_stats.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: right_col_stats,
-                },
-            )?;
+            let ij_cardinality =
+                inner_join_card(left_stats.num_rows, right_stats.num_rows)?;
 
             // The cardinality for inner join can also be used to estimate
             // the cardinality of left/right/full outer joins as long as it
@@ -529,36 +537,99 @@ fn estimate_join_cardinality(
             })
         }
 
-        // For SemiJoins estimation result is either zero, in cases when inputs
-        // are non-overlapping according to statistics, or equal to number of rows
-        // for outer input
+        // For SemiJoins estimation result is either zero (disjoint inputs),
+        // or refined using inner-join cardinality capped at min(outer, inner)
         JoinType::LeftSemi | JoinType::RightSemi => {
             let (outer_stats, inner_stats) = match join_type {
-                JoinType::LeftSemi => (left_stats, right_stats),
-                _ => (right_stats, left_stats),
+                JoinType::LeftSemi => (&left_stats, &right_stats),
+                _ => (&right_stats, &left_stats),
             };
-            let cardinality = match estimate_disjoint_inputs(&outer_stats, &inner_stats) {
-                Some(estimation) => *estimation.get_value()?,
-                None => *outer_stats.num_rows.get_value()?,
+
+            let cardinality =
+                match estimate_disjoint_inputs(outer_stats, inner_stats) {
+                    Some(estimation) => *estimation.get_value()?,
+                    None => {
+                        let outer_rows = *outer_stats.num_rows.get_value()?;
+                        // Each outer row matches at most once, so cap at
+                        // min(outer, inner)
+                        let cap = match inner_stats.num_rows.get_value() {
+                            Some(&ir) => outer_rows.min(ir),
+                            None => outer_rows,
+                        };
+                        // Refine further with inner-join cardinality estimate
+                        let ij_card = inner_join_card(
+                            left_stats.num_rows,
+                            right_stats.num_rows,
+                        );
+                        match ij_card {
+                            Some(ij) => match ij.get_value() {
+                                Some(&ij_val) => ij_val.min(cap),
+                                None => cap,
+                            },
+                            None => cap,
+                        }
+                    }
+                };
+
+            let outer_col_stats = match join_type {
+                JoinType::LeftSemi => left_stats.column_statistics,
+                _ => right_stats.column_statistics,
             };
 
             Some(PartialJoinStatistics {
                 num_rows: cardinality,
-                column_statistics: outer_stats.column_statistics,
+                column_statistics: outer_col_stats,
             })
         }
 
-        // For AntiJoins estimation always equals to outer statistics, as
-        // non-overlapping inputs won't affect estimation
+        // For AntiJoins: if disjoint, all outer rows survive; otherwise
+        // subtract estimated matching rows (from inner-join cardinality)
         JoinType::LeftAnti | JoinType::RightAnti => {
-            let outer_stats = match join_type {
-                JoinType::LeftAnti => left_stats,
-                _ => right_stats,
+            let (outer_stats, inner_stats) = match join_type {
+                JoinType::LeftAnti => (&left_stats, &right_stats),
+                _ => (&right_stats, &left_stats),
+            };
+
+            let outer_rows = *outer_stats.num_rows.get_value()?;
+
+            // If disjoint, no rows are removed
+            let cardinality =
+                match estimate_disjoint_inputs(outer_stats, inner_stats) {
+                    Some(estimation) => match estimation.get_value() {
+                        // Disjoint inputs means zero matching rows, so all
+                        // outer rows survive
+                        Some(0) => outer_rows,
+                        _ => outer_rows,
+                    },
+                    None => {
+                        // Estimate matching rows via inner-join cardinality
+                        let ij_card = inner_join_card(
+                            left_stats.num_rows,
+                            right_stats.num_rows,
+                        );
+                        match ij_card {
+                            Some(ij) => {
+                                let matching = match ij.get_value() {
+                                    Some(&ij_val) => ij_val.min(outer_rows),
+                                    None => 0,
+                                };
+                                outer_rows.saturating_sub(matching)
+                            }
+                            // No inner-join estimate available, fall back to
+                            // outer_rows (no reduction)
+                            None => outer_rows,
+                        }
+                    }
+                };
+
+            let outer_col_stats = match join_type {
+                JoinType::LeftAnti => left_stats.column_statistics,
+                _ => right_stats.column_statistics,
             };
 
             Some(PartialJoinStatistics {
-                num_rows: *outer_stats.num_rows.get_value()?,
-                column_statistics: outer_stats.column_statistics,
+                num_rows: cardinality,
+                column_statistics: outer_col_stats,
             })
         }
 
@@ -2440,11 +2511,13 @@ mod tests {
         //   y: min=0, max=100, distinct=None
         //
         // Join on a=c, b=d (ignore x/y)
+        // NDV for column d is 2500 but capped to num_rows=2000, so
+        // selectivity = max(500, 2000) = 2000, IJ = (1000*2000)/2000 = 1000
         let cases = vec![
-            (JoinType::Inner, 800),
+            (JoinType::Inner, 1000),
             (JoinType::Left, 1000),
             (JoinType::Right, 2000),
-            (JoinType::Full, 2200),
+            (JoinType::Full, 2000),
         ];
 
         let left_col_stats = vec![
@@ -2571,11 +2644,12 @@ mod tests {
 
             // Cardinality computation
             // =======================
+            // Overlapping ranges, no NDV: cap at min(outer=50, inner=10)
             (
                 JoinType::LeftSemi,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(50),
+                Some(10),
             ),
             (
                 JoinType::RightSemi,
@@ -2607,23 +2681,29 @@ mod tests {
                 (10, Inexact(30), Absent, Absent, Absent),
                 Some(0),
             ),
+            // IJ = (50*10)/11 = 45; matching = min(45, 50) = 45
+            // Anti = 50 - 45 = 5
             (
                 JoinType::LeftAnti,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(50),
+                Some(5),
             ),
+            // IJ = 45 as above; matching = min(45, outer=10) = 10
+            // Anti = 10 - 10 = 0
             (
                 JoinType::RightAnti,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(10),
+                Some(0),
             ),
+            // IJ = (10*50)/50 = 10; matching = min(10, 10) = 10
+            // Anti = 10 - 10 = 0
             (
                 JoinType::LeftAnti,
                 (10, Absent, Absent, Absent, Absent),
                 (50, Absent, Absent, Absent, Absent),
-                Some(10),
+                Some(0),
             ),
             (
                 JoinType::LeftAnti,
@@ -2686,6 +2766,149 @@ mod tests {
             assert_eq!(
                 output_cardinality, expected,
                 "failure for join_type: {join_type}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_semi_anti_join_cardinality_with_ndv() -> Result<()> {
+        // When NDV is available, inner-join cardinality refines semi/anti estimates
+        let join_on = vec![(
+            Arc::new(Column::new("l_col", 0)) as _,
+            Arc::new(Column::new("r_col", 0)) as _,
+        )];
+
+        // left: 1000 rows, NDV=100; right: 500 rows, NDV=50
+        // IJ cardinality = (1000 * 500) / max(100, 50) = 5000
+        // Semi = min(5000, min(1000, 500)) = 500
+        // Anti = 1000 - min(5000, 1000) = 0
+        let left_stats = Statistics {
+            num_rows: Inexact(1000),
+            total_byte_size: Absent,
+            column_statistics: vec![create_column_stats(
+                Absent,
+                Absent,
+                Inexact(100),
+                Absent,
+            )],
+        };
+        let right_stats = Statistics {
+            num_rows: Inexact(500),
+            total_byte_size: Absent,
+            column_statistics: vec![create_column_stats(
+                Absent,
+                Absent,
+                Inexact(50),
+                Absent,
+            )],
+        };
+
+        // LeftSemi
+        let semi = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            left_stats.clone(),
+            right_stats.clone(),
+            &join_on,
+        );
+        assert_eq!(semi.map(|s| s.num_rows), Some(500));
+
+        // LeftAnti
+        let anti = estimate_join_cardinality(
+            &JoinType::LeftAnti,
+            left_stats.clone(),
+            right_stats.clone(),
+            &join_on,
+        );
+        assert_eq!(anti.map(|s| s.num_rows), Some(0));
+
+        // RightSemi: outer=right(500), inner=left(1000)
+        // IJ = 5000, cap = min(500, 1000) = 500, semi = min(5000, 500) = 500
+        let rsemi = estimate_join_cardinality(
+            &JoinType::RightSemi,
+            left_stats.clone(),
+            right_stats.clone(),
+            &join_on,
+        );
+        assert_eq!(rsemi.map(|s| s.num_rows), Some(500));
+
+        // RightAnti: outer=right(500), matching = min(5000, 500) = 500
+        // anti = 500 - 500 = 0
+        let ranti = estimate_join_cardinality(
+            &JoinType::RightAnti,
+            left_stats,
+            right_stats,
+            &join_on,
+        );
+        assert_eq!(ranti.map(|s| s.num_rows), Some(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_semi_join_ndv_tighter_than_min() -> Result<()> {
+        // When inner-join cardinality is lower than min(outer, inner),
+        // the semi-join should use the inner-join estimate.
+        let join_on = vec![(
+            Arc::new(Column::new("l_col", 0)) as _,
+            Arc::new(Column::new("r_col", 0)) as _,
+        )];
+
+        // left: 100 rows, NDV=50; right: 100 rows, NDV=50
+        // IJ = (100 * 100) / 50 = 200
+        // Semi = min(200, min(100, 100)) = 100
+        //
+        // (left_rows, left_ndv, right_rows, right_ndv, expected_semi)
+        let cases: Vec<(usize, usize, usize, usize, usize)> = vec![
+            // IJ = 200, cap = 100, semi = 100
+            (100, 50, 100, 50, 100),
+            // IJ = (100 * 100) / 100 = 100, cap = 100, semi = 100
+            (100, 100, 100, 100, 100),
+            // IJ = (1000 * 10) / 10 = 1000, cap = min(1000, 10) = 10, semi = 10
+            (1000, 10, 10, 10, 10),
+            // IJ = (10 * 1000) / 10 = 1000, cap = min(10, 1000) = 10, semi = 10
+            (10, 10, 1000, 10, 10),
+            // IJ = (100 * 100) / 90 = 111, cap = min(100, 100) = 100, semi = 100
+            (100, 90, 100, 50, 100),
+            // IJ = (50 * 200) / 100 = 100, cap = min(50, 200) = 50, semi = 50
+            (50, 100, 200, 100, 50),
+            // IJ = (200 * 50) / 100 = 100, cap = min(200, 50) = 50, semi = 50
+            (200, 100, 50, 100, 50),
+        ];
+
+        for (lr, ln, rr, rn, expected) in cases {
+            let left_stats = Statistics {
+                num_rows: Inexact(lr),
+                total_byte_size: Absent,
+                column_statistics: vec![create_column_stats(
+                    Absent,
+                    Absent,
+                    Inexact(ln),
+                    Absent,
+                )],
+            };
+            let right_stats = Statistics {
+                num_rows: Inexact(rr),
+                total_byte_size: Absent,
+                column_statistics: vec![create_column_stats(
+                    Absent,
+                    Absent,
+                    Inexact(rn),
+                    Absent,
+                )],
+            };
+
+            let result = estimate_join_cardinality(
+                &JoinType::LeftSemi,
+                left_stats,
+                right_stats,
+                &join_on,
+            );
+            assert_eq!(
+                result.map(|s| s.num_rows),
+                Some(expected),
+                "LeftSemi: left({lr}, ndv={ln}) x right({rr}, ndv={rn})"
             );
         }
 
