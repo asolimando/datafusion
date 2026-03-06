@@ -93,13 +93,17 @@ fn supports_collect_by_thresholds(
         return false;
     };
 
-    if let Some(byte_size) = stats.total_byte_size.get_value() {
-        *byte_size != 0 && *byte_size < threshold_byte_size
-    } else if let Some(num_rows) = stats.num_rows.get_value() {
-        *num_rows != 0 && *num_rows < threshold_num_rows
-    } else {
-        false
-    }
+    // Either signal independently qualifies for CollectLeft: if byte_size
+    // is small enough OR num_rows is small enough, we can collect
+    let byte_size_ok = stats
+        .total_byte_size
+        .get_value()
+        .is_some_and(|&bs| bs != 0 && bs < threshold_byte_size);
+    let num_rows_ok = stats
+        .num_rows
+        .get_value()
+        .is_some_and(|&nr| nr != 0 && nr < threshold_num_rows);
+    byte_size_ok || num_rows_ok
 }
 
 impl PhysicalOptimizerRule for JoinSelection {
