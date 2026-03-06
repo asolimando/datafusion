@@ -671,7 +671,8 @@ mod test {
             Some((DATE_2025_03_01, DATE_2025_03_04)),
         );
         expected_full_statistics.num_rows = Precision::Inexact(4);
-        expected_full_statistics.total_byte_size = Precision::Absent;
+        // RightSemi: byte_size estimated from right side's avg bytes/row (32/4=8) * 4 rows
+        expected_full_statistics.total_byte_size = Precision::Inexact(32);
         assert_eq!(full_statistics, expected_full_statistics);
 
         // Test partition_statistics(Some(idx)) - returns partition-specific statistics
@@ -684,7 +685,7 @@ mod test {
             Some((DATE_2025_03_01, DATE_2025_03_02)),
         );
         expected_statistic_partition_1.num_rows = Precision::Inexact(2);
-        expected_statistic_partition_1.total_byte_size = Precision::Absent;
+        expected_statistic_partition_1.total_byte_size = Precision::Inexact(16);
 
         // Partition 2: ids [1,2], dates [2025-03-03, 2025-03-04]
         let mut expected_statistic_partition_2 = create_partition_statistics(
@@ -695,7 +696,7 @@ mod test {
             Some((DATE_2025_03_03, DATE_2025_03_04)),
         );
         expected_statistic_partition_2.num_rows = Precision::Inexact(2);
-        expected_statistic_partition_2.total_byte_size = Precision::Absent;
+        expected_statistic_partition_2.total_byte_size = Precision::Inexact(16);
 
         let statistics = (0..nested_loop_join.output_partitioning().partition_count())
             .map(|idx| nested_loop_join.partition_statistics(Some(idx)))
@@ -931,7 +932,11 @@ mod test {
             num_rows: Precision::Exact(0),
             total_byte_size: Precision::Absent,
             column_statistics: vec![
-                ColumnStatistics::new_unknown(),
+                // Group-by column gets distinct_count=Exact(0) when num_rows=0
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(0),
+                    ..ColumnStatistics::new_unknown()
+                },
                 ColumnStatistics::new_unknown(),
                 ColumnStatistics::new_unknown(),
             ],

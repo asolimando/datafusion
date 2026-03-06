@@ -447,16 +447,71 @@ pub(crate) fn estimate_join_statistics(
     join_type: &JoinType,
     schema: &Schema,
 ) -> Result<Statistics> {
+    // Capture byte_size info before stats are consumed by cardinality estimation
+    let left_bpr = avg_bytes_per_row(&left_stats);
+    let right_bpr = avg_bytes_per_row(&right_stats);
+
     let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, on);
     let (num_rows, column_statistics) = match join_stats {
         Some(stats) => (Precision::Inexact(stats.num_rows), stats.column_statistics),
         None => (Precision::Absent, Statistics::unknown_column(schema)),
     };
+
+    let total_byte_size =
+        estimate_join_byte_size(left_bpr, right_bpr, join_type, &num_rows);
+
     Ok(Statistics {
         num_rows,
-        total_byte_size: Precision::Absent,
+        total_byte_size,
         column_statistics,
     })
+}
+
+/// Average bytes per row from statistics, if both num_rows and byte_size are known
+fn avg_bytes_per_row(stats: &Statistics) -> Option<f64> {
+    let rows = *stats.num_rows.get_value()?;
+    let bytes = *stats.total_byte_size.get_value()?;
+    if rows > 0 {
+        Some(bytes as f64 / rows as f64)
+    } else {
+        None
+    }
+}
+
+/// Estimate total_byte_size for join output from input average row widths
+fn estimate_join_byte_size(
+    left_bpr: Option<f64>,
+    right_bpr: Option<f64>,
+    join_type: &JoinType,
+    output_num_rows: &Precision<usize>,
+) -> Precision<usize> {
+    let output_rows = match output_num_rows.get_value() {
+        Some(&r) if r > 0 => r,
+        _ => return Precision::Absent,
+    };
+
+    let row_width = match join_type {
+        // Inner/Full/Left/Right: output has columns from both sides
+        JoinType::Inner
+        | JoinType::Full
+        | JoinType::Left
+        | JoinType::Right => match (left_bpr, right_bpr) {
+            (Some(l), Some(r)) => Some(l + r),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            _ => None,
+        },
+        // Semi/Anti/Mark: output has columns from outer side only
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => left_bpr,
+        JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+            right_bpr
+        }
+    };
+
+    match row_width {
+        Some(w) => Precision::Inexact((w * output_rows as f64).ceil() as usize),
+        None => Precision::Absent,
+    }
 }
 
 // Estimate the cardinality for the given join with input statistics.
@@ -2770,6 +2825,121 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_avg_bytes_per_row() {
+        // Both present
+        let stats = Statistics {
+            num_rows: Inexact(100),
+            total_byte_size: Inexact(5000),
+            column_statistics: vec![],
+        };
+        assert_eq!(avg_bytes_per_row(&stats), Some(50.0));
+
+        // Zero rows
+        let stats = Statistics {
+            num_rows: Inexact(0),
+            total_byte_size: Inexact(0),
+            column_statistics: vec![],
+        };
+        assert_eq!(avg_bytes_per_row(&stats), None);
+
+        // Missing byte_size
+        let stats = Statistics {
+            num_rows: Inexact(100),
+            total_byte_size: Absent,
+            column_statistics: vec![],
+        };
+        assert_eq!(avg_bytes_per_row(&stats), None);
+
+        // Missing num_rows
+        let stats = Statistics {
+            num_rows: Absent,
+            total_byte_size: Inexact(5000),
+            column_statistics: vec![],
+        };
+        assert_eq!(avg_bytes_per_row(&stats), None);
+    }
+
+    #[test]
+    fn test_estimate_join_byte_size() {
+        // Inner join with both sides known
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                Some(20.0),
+                &JoinType::Inner,
+                &Inexact(100),
+            ),
+            Inexact(3000)
+        );
+
+        // LeftSemi: only left side width
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                Some(20.0),
+                &JoinType::LeftSemi,
+                &Inexact(50),
+            ),
+            Inexact(500)
+        );
+
+        // RightAnti: only right side width
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                Some(20.0),
+                &JoinType::RightAnti,
+                &Inexact(30),
+            ),
+            Inexact(600)
+        );
+
+        // Missing both byte_per_row -> Absent
+        assert_eq!(
+            estimate_join_byte_size(
+                None,
+                None,
+                &JoinType::Inner,
+                &Inexact(100),
+            ),
+            Absent
+        );
+
+        // Zero output rows -> Absent
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                Some(20.0),
+                &JoinType::Inner,
+                &Inexact(0),
+            ),
+            Absent
+        );
+
+        // Absent num_rows -> Absent
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                Some(20.0),
+                &JoinType::Inner,
+                &Absent,
+            ),
+            Absent
+        );
+
+        // Inner with only left known
+        assert_eq!(
+            estimate_join_byte_size(
+                Some(10.0),
+                None,
+                &JoinType::Inner,
+                &Inexact(100),
+            ),
+            Inexact(1000)
+        );
     }
 
     #[test]
