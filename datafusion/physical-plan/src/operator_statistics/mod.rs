@@ -281,7 +281,11 @@ impl StatisticsProvider for DefaultStatisticsProvider {
 /// Registry that chains [`StatisticsProvider`] implementations.
 ///
 /// The registry is a stateless provider chain: it holds no mutable state
-/// and is cheaply `Clone`able / `Send` / `Sync`.
+/// and is cheaply `Clone`able / `Send` / `Sync`. For memoized computation
+/// across multiple `compute` calls within a single optimization pass, use
+/// [`compute_cached`](Self::compute_cached) with a caller-owned
+/// [`StatsCache`]. This design follows Apache Calcite's `RelMetadataQuery`
+/// pattern, where the cache is per-query and scoped to the caller.
 #[derive(Clone)]
 pub struct StatisticsRegistry {
     providers: Vec<Arc<dyn StatisticsProvider>>,
@@ -296,6 +300,39 @@ impl Debug for StatisticsRegistry {
 impl Default for StatisticsRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-pass memoization cache for [`StatisticsRegistry::compute_cached`].
+///
+/// Keyed by plan node pointer address. Create one per optimization pass
+/// and drop it when the pass completes to limit stale entries.
+///
+/// # Limitations
+///
+/// During `transform_up`, replaced plan nodes are deallocated and the
+/// allocator may reuse their addresses for new nodes within the same pass.
+/// A cache hit on a reused address would return stale statistics.
+///
+/// TODO: use a monotonic plan-node ID as cache key instead of pointer
+/// address to eliminate aliasing risk entirely.
+///
+/// # Example
+///
+/// ```ignore
+/// let registry = StatisticsRegistry::default_with_builtin_providers();
+/// let mut cache = StatsCache::new();
+/// let left_stats = registry.compute_cached(left, &mut cache)?;
+/// let right_stats = registry.compute_cached(right, &mut cache)?;
+/// // cache is dropped at end of scope
+/// ```
+#[derive(Debug, Default)]
+pub struct StatsCache(HashMap<usize, ExtendedStatistics>);
+
+impl StatsCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self(HashMap::new())
     }
 }
 
@@ -352,43 +389,87 @@ impl StatisticsRegistry {
 
     /// Compute extended statistics for a plan through the provider chain.
     ///
-    /// Performs a bottom-up tree walk: child statistics are computed recursively
-    /// and passed to providers, mirroring how `partition_statistics` composes
-    /// operators. Once [#20184](https://github.com/apache/datafusion/issues/20184)
-    /// lands, the registry can feed enriched base stats directly into
-    /// `partition_statistics(child_stats)`, removing the need for a separate walk.
-    ///
-    /// If no providers are registered, falls back to the plan's built-in
-    /// `partition_statistics(None)` with no overhead.
+    /// Convenience method that creates a fresh [`StatsCache`] per call.
+    /// For repeated calls within the same optimization pass (e.g., comparing
+    /// left/right sides of a join), use [`compute_cached`](Self::compute_cached)
+    /// with a shared cache to avoid redundant subtree walks.
     pub fn compute(&self, plan: &dyn ExecutionPlan) -> Result<ExtendedStatistics> {
+        let mut cache = StatsCache::new();
+        self.compute_cached(plan, &mut cache)
+    }
+
+    /// Compute extended statistics with memoization via a caller-owned cache.
+    ///
+    /// Results are keyed by plan pointer address. Repeated calls for the
+    /// same plan node (or shared subtrees) return cached results without
+    /// re-walking the tree.
+    ///
+    /// The cache should be scoped to a single optimization pass: create it
+    /// before the pass, share it across all `compute_cached` calls within
+    /// that pass, and drop it when the pass completes.
+    ///
+    /// If no providers are registered, immediately falls back to the plan's
+    /// built-in `partition_statistics(None)` with no overhead (no caching).
+    ///
+    /// When providers are registered:
+    /// - For leaf nodes, providers are called with empty child stats
+    /// - For non-leaf nodes, child stats are recursively computed first
+    ///   and passed to providers
+    /// - If no provider claims the node, falls back to `partition_statistics(None)`
+    ///
+    /// # Note on #20184
+    ///
+    /// This method performs its own bottom-up tree walk, separate from the
+    /// walk that optimizer rules do via `transform_up`. Once
+    /// [#20184](https://github.com/apache/datafusion/issues/20184) lands,
+    /// the registry can feed enriched base stats into `partition_statistics(child_stats)`,
+    /// removing redundancy for the base-stats path. The separate walk is still needed
+    /// for extension propagation as long as `partition_statistics` returns `Arc<Statistics>`
+    /// rather than a type that carries the extension map.
+    pub fn compute_cached(
+        &self,
+        plan: &dyn ExecutionPlan,
+        cache: &mut StatsCache,
+    ) -> Result<ExtendedStatistics> {
         // Fast path: no providers registered, skip the walk entirely
         if self.providers.is_empty() {
             let base = plan.partition_statistics(None)?;
             return Ok(ExtendedStatistics::new_arc(base));
         }
 
+        // Check memoization cache
+        let key = plan as *const dyn ExecutionPlan as *const () as usize;
+        if let Some(cached) = cache.0.get(&key) {
+            return Ok(cached.clone());
+        }
+
         let children = plan.children();
 
-        // For leaf nodes, try providers with empty child stats.
-        // For non-leaf nodes, recursively compute enhanced child stats first.
+        // For leaf nodes, try providers with empty child stats
+        // For non-leaf nodes, recursively compute enhanced child stats first
         let child_stats: Vec<ExtendedStatistics> = if children.is_empty() {
             Vec::new()
         } else {
             children
                 .iter()
-                .map(|child| self.compute(child.as_ref()))
+                .map(|child| self.compute_cached(child.as_ref(), cache))
                 .collect::<Result<Vec<_>>>()?
         };
 
-        for provider in &self.providers {
-            match provider.compute_statistics(plan, &child_stats)? {
-                StatisticsResult::Computed(stats) => return Ok(stats),
-                StatisticsResult::Delegate => continue,
+        let result = 'chain: {
+            for provider in &self.providers {
+                match provider.compute_statistics(plan, &child_stats)? {
+                    StatisticsResult::Computed(stats) => break 'chain stats,
+                    StatisticsResult::Delegate => continue,
+                }
             }
-        }
-        // Fallback: use plan's built-in stats
-        let base = plan.partition_statistics(None)?;
-        Ok(ExtendedStatistics::new_arc(base))
+            // Fallback: use plan's built-in stats
+            let base = plan.partition_statistics(None)?;
+            ExtendedStatistics::new_arc(base)
+        };
+
+        cache.0.insert(key, result.clone());
+        Ok(result)
     }
 
     /// Compute statistics and return only the base Statistics (no extensions).
