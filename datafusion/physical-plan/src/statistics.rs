@@ -29,6 +29,7 @@ use datafusion_common::extensions::Extensions;
 use datafusion_common::{
     Result, Statistics, assert_eq_or_internal_err, assert_or_internal_err,
 };
+use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 use log::debug;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,12 +65,20 @@ struct StatsCache {
     extensions: HashMap<CacheKey, Extensions>,
 }
 
+/// Fields of [`StatisticsArgs`] that every node in a walk inherits, unlike
+/// `partition`, which is chosen per node.
+#[derive(Debug, Default, Clone)]
+struct WalkScoped {
+    synopsis_registry: Option<Arc<SynopsisRegistry>>,
+}
+
 /// Arguments passed to [`ExecutionPlan::statistics_from_inputs`] carrying
 /// external information that operators can use when computing their
 /// statistics.
 #[derive(Debug, Default, Clone)]
 pub struct StatisticsArgs {
     partition: Option<usize>,
+    walk: WalkScoped,
 }
 
 impl StatisticsArgs {
@@ -99,6 +108,32 @@ impl StatisticsArgs {
     /// Return the partition to compute statistics
     pub fn partition(&self) -> Option<usize> {
         self.partition
+    }
+
+    /// Sets the expression-level statistics providers for every node in the
+    /// walk.
+    pub(crate) fn with_synopsis_registry(
+        mut self,
+        synopsis_registry: Arc<SynopsisRegistry>,
+    ) -> Self {
+        self.walk.synopsis_registry = Some(synopsis_registry);
+        self
+    }
+
+    /// The expression-level statistics providers for this walk, empty when
+    /// none are registered.
+    pub fn synopsis_registry(&self) -> &SynopsisRegistry {
+        static EMPTY: SynopsisRegistry = SynopsisRegistry::new();
+        self.walk.synopsis_registry.as_deref().unwrap_or(&EMPTY)
+    }
+
+    /// Arguments for a child resolved at `partition`, keeping the walk-scoped
+    /// fields. [`Self::new`] would drop them.
+    pub fn for_child(&self, partition: Option<usize>) -> Self {
+        Self {
+            partition,
+            walk: self.walk.clone(),
+        }
     }
 }
 
@@ -131,6 +166,7 @@ pub enum ChildStats {
 pub struct StatisticsContext {
     cache: Rc<RefCell<StatsCache>>,
     registry: StatisticsRegistry,
+    synopsis_registry: Option<Arc<SynopsisRegistry>>,
 }
 
 impl Default for StatisticsContext {
@@ -150,7 +186,15 @@ impl StatisticsContext {
         Self {
             cache: Rc::new(RefCell::new(StatsCache::default())),
             registry,
+            synopsis_registry: None,
         }
+    }
+
+    /// Makes `synopsis_registry` available to every node and provider in
+    /// this walk.
+    pub fn with_synopsis_registry(mut self, synopsis_registry: SynopsisRegistry) -> Self {
+        self.synopsis_registry = Some(Arc::new(synopsis_registry));
+        self
     }
 
     /// Clears the memoization cache.
@@ -239,6 +283,22 @@ impl StatisticsContext {
         plan: &dyn ExecutionPlan,
         args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
+        // The context's registry applies to every node in the walk. Entry
+        // points often pass bare `StatisticsArgs::new()`.
+        let stamped;
+        let args = match &self.synopsis_registry {
+            Some(registry)
+                if !args
+                    .walk
+                    .synopsis_registry
+                    .as_ref()
+                    .is_some_and(|r| Arc::ptr_eq(r, registry)) =>
+            {
+                stamped = args.clone().with_synopsis_registry(Arc::clone(registry));
+                &stamped
+            }
+            _ => args,
+        };
         let partition = args.partition();
 
         if let Some(idx) = partition {
@@ -264,7 +324,7 @@ impl StatisticsContext {
                 let requests = plan.child_stats_requests(partition);
                 self.validate_child_requests(plan, &children, &requests)?;
                 let child_statistics =
-                    self.resolve_children(plan, &children, &requests)?;
+                    self.resolve_children(plan, &children, &requests, args)?;
                 plan.statistics_from_inputs(&child_statistics, args)?
             }
         };
@@ -311,6 +371,7 @@ impl StatisticsContext {
         plan: &dyn ExecutionPlan,
         children: &[&Arc<dyn ExecutionPlan>],
         requests: &[ChildStats],
+        args: &StatisticsArgs,
     ) -> Result<Vec<Arc<Statistics>>> {
         children
             .iter()
@@ -318,7 +379,7 @@ impl StatisticsContext {
             .enumerate()
             .map(|(i, (child, directive))| match directive {
                 ChildStats::At(p) => self
-                    .compute_base(child.as_ref(), &StatisticsArgs::new().with_partition(*p))
+                    .compute_base(child.as_ref(), &args.for_child(*p))
                     .map_err(|e| {
                         e.context(format!(
                             "computing statistics for child {i} ({}) of {} at partition {p:?}",
@@ -363,7 +424,8 @@ impl StatisticsContext {
             // error-swallowing, whoever genuinely needs the child resolves it again
             // and the error resurfaces there; a matched provider's own `compute`
             // error below stays fatal.
-            let child_statistics = match self.resolve_children(plan, children, &requests)
+            let child_statistics = match self
+                .resolve_children(plan, children, &requests, args)
             {
                 Ok(child_statistics) => child_statistics,
                 Err(e) => {
