@@ -479,7 +479,9 @@ impl<'a> SynopsisContext<'a> {
                 .and_then(|s| conform(s, data_type))
                 .unwrap_or_else(|| ExprSynopsis::unknown(data_type.clone()))
         } else {
-            ExprSynopsis::unknown(data_type.clone())
+            let mut synopsis = ExprSynopsis::unknown(data_type.clone());
+            synopsis.column.null_count = self.operand_null_count(expr, &children);
+            synopsis
         };
         if let Some(column) = self.conditioned_column(expr, data_type) {
             synopsis = column;
@@ -541,6 +543,30 @@ impl<'a> SynopsisContext<'a> {
             self.attach_column_extensions(expr, synopsis);
         }
         synopsis
+    }
+
+    /// The null count of a predicate whose operands are not Boolean, such as a
+    /// comparison, from its own rule over its operands, which are cheap to
+    /// compute. Interval analysis gives no null count.
+    fn operand_null_count(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        children: &[&Arc<dyn PhysicalExpr>],
+    ) -> Precision<usize> {
+        let schema = self.args.input_schema();
+        let not_boolean = children.iter().all(|child| {
+            child
+                .data_type(schema)
+                .is_ok_and(|data_type| data_type != DataType::Boolean)
+        });
+        if !not_boolean {
+            return Precision::Absent;
+        }
+        let operands: Option<Vec<ExprSynopsis>> =
+            children.iter().map(|child| self.compute(child)).collect();
+        operands
+            .and_then(|operands| expr.synopsis_from_inputs(&self.args, &operands))
+            .map_or(Precision::Absent, |synopsis| synopsis.column.null_count)
     }
 
     /// Runs `analyze()` on `expr`'s own subtree and caches the outcome, so
@@ -1369,6 +1395,58 @@ mod tests {
         );
     }
 
+    // A non-NULL row passes exactly one of `=` and `!=`, And keeps no more
+    // rows than either side, and every selectivity is in [0, 1]. And is
+    // unknown when neither side has a selectivity (here, a column that is not
+    // a predicate and `Modulo`, which has no rule), so the caller's default
+    // applies.
+    #[test]
+    fn comparison_and_logical_selectivity_rules() {
+        let (stats, schema) = one_col_stats(10, DataType::Int64);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let selectivity = |expr: &Arc<dyn PhysicalExpr>| {
+            let sel = ctx
+                .compute(expr)
+                .and_then(|s| s.selectivity)
+                .expect("the predicate has a selectivity");
+            assert!((0.0..=1.0).contains(&sel), "{expr}: {sel}");
+            sel
+        };
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("col0", 0));
+
+        let eq: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Eq, lit(5_i64)));
+        let not_eq: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::NotEq, lit(5_i64)));
+        let (eq_sel, not_eq_sel) = (selectivity(&eq), selectivity(&not_eq));
+        assert!(
+            (eq_sel + not_eq_sel - 1.0).abs() < 1e-9,
+            "with no NULLs, a row passes exactly one of `=` and `!=`"
+        );
+
+        let and: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&eq),
+            Operator::And,
+            Arc::clone(&not_eq),
+        ));
+        assert!(
+            selectivity(&and) <= eq_sel.min(not_eq_sel),
+            "And keeps no more rows than either side"
+        );
+
+        let no_rule: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Modulo,
+            lit(3_i64),
+        ));
+        let and_missing_side: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a, Operator::And, no_rule));
+        assert!(
+            ctx.compute(&and_missing_side).is_none(),
+            "And is unknown when neither side has a selectivity"
+        );
+    }
+
     /// `p_size` (Int32, 1 to 50, 50 distinct values) and `p_type` (Utf8,
     /// no statistics), over 1000 rows.
     fn part_stats() -> (Statistics, Schema) {
@@ -1674,6 +1752,32 @@ mod tests {
             (selectivity - 0.1).abs() < 1e-9,
             "0.2 for `a > 40` times the default 0.5, got {selectivity}"
         );
+    }
+
+    // A NULL row passes neither `=` nor `!=`, so with half the rows NULL the
+    // two keep half the rows between them.
+    #[test]
+    fn equality_selectivity_excludes_nulls() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(10),
+                null_count: Precision::Exact(50),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let selectivity = |op: Operator| {
+            let expr: Arc<dyn PhysicalExpr> =
+                Arc::new(BinaryExpr::new(Arc::new(Column::new("s", 0)), op, lit("x")));
+            ctx.compute(&expr)
+                .and_then(|s| s.selectivity)
+                .expect("the comparison has a selectivity")
+        };
+        let both = selectivity(Operator::Eq) + selectivity(Operator::NotEq);
+        assert!((both - 0.5).abs() < 1e-9, "got {both}");
     }
 
     // `check_support` accepts `col0 > 50.0`, but the column statistics are

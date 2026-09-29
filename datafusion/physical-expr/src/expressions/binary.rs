@@ -561,6 +561,64 @@ fn null_count_beside_constant(
     }
 }
 
+/// The fraction of the `num_rows` input rows where an operand is NULL, or 0.0
+/// when the null count is unknown.
+fn null_frac(
+    left: &ExprSynopsis,
+    right: &ExprSynopsis,
+    num_rows: Precision<usize>,
+) -> f64 {
+    match (
+        null_count_beside_constant(left, right).get_value(),
+        num_rows.get_value(),
+    ) {
+        (Some(&nulls), Some(&rows)) if rows > 0 => {
+            (nulls as f64 / rows as f64).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// The synopsis of a comparison: its selectivity, when known, and its null
+/// count beside a constant.
+fn comparison_synopsis(
+    selectivity: Option<f64>,
+    left: &ExprSynopsis,
+    right: &ExprSynopsis,
+) -> Option<ExprSynopsis> {
+    Some(ExprSynopsis {
+        selectivity,
+        column: ColumnStatistics {
+            null_count: null_count_beside_constant(left, right),
+            ..ColumnStatistics::new_unknown()
+        },
+        ..ExprSynopsis::unknown(DataType::Boolean)
+    })
+}
+
+/// Equality selectivity under the uniform-distribution assumption: the
+/// non-NULL rows spread evenly over `ndv` values. A constant side says nothing
+/// about how many rows match it, so the other side's distinct count is
+/// required. With two non-constant sides, the larger distinct count is used.
+/// A distinct count of zero means the column has no rows, so the selectivity
+/// is 0.0.
+fn eq_selectivity(
+    left: &ExprSynopsis,
+    right: &ExprSynopsis,
+    num_rows: Precision<usize>,
+) -> Option<f64> {
+    let ndv = match (left.ndv(), right.ndv()) {
+        (Some(1), other) | (other, Some(1)) => other?,
+        (Some(l), Some(r)) => l.max(r),
+        (Some(n), None) | (None, Some(n)) => n,
+        (None, None) => return None,
+    };
+    if ndv == 0 {
+        return Some(0.0);
+    }
+    Some((1.0 - null_frac(left, right, num_rows)) / ndv as f64)
+}
+
 impl PhysicalExpr for BinaryExpr {
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
         BinaryTypeCoercer::new(
@@ -610,6 +668,28 @@ impl PhysicalExpr for BinaryExpr {
                     column,
                     ..ExprSynopsis::unknown(output_type)
                 })
+            }
+            // Equality selectivity under the uniform-distribution assumption:
+            // with `ndv` distinct values spread evenly, one value matches a
+            // `1 / ndv` fraction of the rows.
+            Operator::Eq => {
+                let num_rows = args.input_stats().num_rows;
+                let selectivity = eq_selectivity(left, right, num_rows)?;
+                comparison_synopsis(Some(selectivity), left, right)
+            }
+            // The non-NULL rows that equality does not keep.
+            Operator::NotEq => {
+                let num_rows = args.input_stats().num_rows;
+                let selectivity = 1.0
+                    - null_frac(left, right, num_rows)
+                    - eq_selectivity(left, right, num_rows)?;
+                comparison_synopsis(Some(selectivity), left, right)
+            }
+            // A range comparison that interval analysis does not support has no
+            // selectivity, so the caller's default applies, but it still has a
+            // null count.
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                comparison_synopsis(None, left, right)
             }
             // Conjunction selectivity under the independence assumption: the
             // fraction of rows that pass both predicates is the product of the

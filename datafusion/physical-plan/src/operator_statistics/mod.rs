@@ -2154,6 +2154,45 @@ mod tests {
         Ok(())
     }
 
+    /// The built-in comparison rules do not replace interval analysis for a
+    /// predicate it supports: `a > 40`, with `a` from 0 to 99, keeps 59 of the
+    /// 100 values.
+    #[test]
+    fn test_filter_builtin_rule_does_not_override_interval_analysis() -> Result<()> {
+        use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let column_statistics = vec![ColumnStatistics {
+            min_value: Precision::Exact(ScalarValue::Int32(Some(0))),
+            max_value: Precision::Exact(ScalarValue::Int32(Some(99))),
+            ..ColumnStatistics::new_unknown()
+        }];
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::with_column_stats(
+            Arc::clone(&schema),
+            Precision::Exact(1000),
+            column_statistics,
+        ));
+
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("a", &schema)?,
+            Operator::Gt,
+            lit(40i32),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, source)?);
+
+        let stats = StatisticsContext::new_with_registry(StatisticsRegistry::new())
+            .with_synopsis_registry(SynopsisRegistry::new())
+            .compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(590),
+            "1000 rows * 0.59 from interval analysis"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_projection_statistics_propagation() -> Result<()> {
         let registry = StatisticsRegistry::new();
