@@ -30,6 +30,7 @@ use datafusion_expr::ColumnarValue;
 use datafusion_expr::interval_arithmetic::Interval;
 #[expect(deprecated)]
 use datafusion_expr::statistics::Distribution::{self, Bernoulli};
+use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
 /// Not expression
 #[derive(Debug, Eq)]
@@ -113,6 +114,37 @@ impl PhysicalExpr for NotExpr {
 
     fn evaluate_bounds(&self, children: &[&Interval]) -> Result<Interval> {
         children[0].not()
+    }
+
+    // Three-valued logic: a row where the child predicate is NULL passes
+    // neither the predicate nor its negation, so the null fraction of the
+    // input rows is subtracted from the complement of the selectivity. The
+    // result is clamped to [0, 1], because both inputs are estimates.
+    fn synopsis_from_inputs(
+        &self,
+        args: &SynopsisArgs,
+        child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        let [child] = child_synopses else {
+            return None;
+        };
+        let null_count = child.column.null_count.get_value().copied().unwrap_or(0);
+        let num_rows = args
+            .input_stats()
+            .num_rows
+            .get_value()
+            .copied()
+            .unwrap_or(0);
+        let null_frac = if num_rows > 0 {
+            null_count as f64 / num_rows as f64
+        } else {
+            0.0
+        };
+        let selectivity = 1.0 - child.selectivity? - null_frac;
+        Some(ExprSynopsis {
+            selectivity: Some(selectivity.clamp(0.0, 1.0)),
+            ..ExprSynopsis::unknown(DataType::Boolean)
+        })
     }
 
     fn propagate_constraints(

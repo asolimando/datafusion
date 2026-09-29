@@ -1214,6 +1214,126 @@ mod tests {
         );
     }
 
+    /// Gives a named Boolean column a selectivity and a null count.
+    #[derive(Debug)]
+    struct PredicateWithNulls {
+        column: &'static str,
+        selectivity: f64,
+        null_count: usize,
+    }
+    impl SynopsisProvider for PredicateWithNulls {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(col) = expr.downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            if col.name() != self.column {
+                return SynopsisResult::Delegate;
+            }
+            SynopsisResult::Computed(ExprSynopsis {
+                selectivity: Some(self.selectivity),
+                column: ColumnStatistics {
+                    null_count: Precision::Exact(self.null_count),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ..ExprSynopsis::unknown(DataType::Boolean)
+            })
+        }
+    }
+
+    // A NULL row passes neither `=` nor `!=`, so with half the rows NULL the
+    // two keep half the rows between them.
+    #[test]
+    fn equality_selectivity_excludes_nulls() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(10),
+                null_count: Precision::Exact(50),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let selectivity = |op: Operator| {
+            let expr: Arc<dyn PhysicalExpr> =
+                Arc::new(BinaryExpr::new(Arc::new(Column::new("s", 0)), op, lit("x")));
+            ctx.compute(&expr)
+                .and_then(|s| s.selectivity)
+                .expect("the comparison has a selectivity")
+        };
+        let both = selectivity(Operator::Eq) + selectivity(Operator::NotEq);
+        assert!((both - 0.5).abs() < 1e-9, "got {both}");
+    }
+
+    // A comparison takes its column's null count even when interval analysis
+    // supplies its selectivity, so `a > 49` and `NOT (a > 49)` keep the 90
+    // non-NULL rows of 100 between them.
+    #[test]
+    fn not_subtracts_the_null_fraction_of_a_comparison() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(100),
+                null_count: Precision::Exact(10),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(0))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(99))),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let selectivity = |expr: &Arc<dyn PhysicalExpr>| {
+            ctx.compute(expr)
+                .and_then(|s| s.selectivity)
+                .expect("the predicate has a selectivity")
+        };
+        let gt: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            lit(49_i32),
+        ));
+        let not_gt: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(Arc::clone(&gt)));
+        let both = selectivity(&gt) + selectivity(&not_gt);
+        assert!((both - 0.9).abs() < 1e-9, "got {both}");
+    }
+
+    // A row where the child predicate is NULL passes neither the predicate
+    // nor its negation, so `NotExpr` subtracts the null fraction.
+    #[test]
+    fn not_expr_subtracts_null_fraction() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let schema = Schema::new(vec![Field::new("p", DataType::Boolean, true)]);
+        let registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(PredicateWithNulls {
+                column: "p",
+                selectivity: 0.3,
+                null_count: 20,
+            })]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let p: Arc<dyn PhysicalExpr> = Arc::new(Column::new("p", 0));
+        let not_p: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(p));
+        let sel = ctx
+            .compute(&not_p)
+            .and_then(|s| s.selectivity)
+            .expect("NotExpr has a synopsis");
+        assert!(
+            (sel - 0.5).abs() < 1e-9,
+            "1.0 - 0.3 selectivity - 20/100 null fraction = 0.5; ignoring the null \
+             fraction would give 0.7"
+        );
+    }
+
     /// A test-local stand-in for cross-column correlation metadata the input
     /// might carry: two columns tend to satisfy their comparisons together
     /// more often (or less often) than independence would predict.
@@ -1761,32 +1881,6 @@ mod tests {
             (selectivity - 0.1).abs() < 1e-9,
             "0.2 for `a > 40` times the default 0.5, got {selectivity}"
         );
-    }
-
-    // A NULL row passes neither `=` nor `!=`, so with half the rows NULL the
-    // two keep half the rows between them.
-    #[test]
-    fn equality_selectivity_excludes_nulls() {
-        let stats = Statistics {
-            num_rows: Precision::Exact(100),
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics {
-                distinct_count: Precision::Exact(10),
-                null_count: Precision::Exact(50),
-                ..ColumnStatistics::new_unknown()
-            }],
-        };
-        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
-        let ctx = SynopsisContext::new(&stats, &schema);
-        let selectivity = |op: Operator| {
-            let expr: Arc<dyn PhysicalExpr> =
-                Arc::new(BinaryExpr::new(Arc::new(Column::new("s", 0)), op, lit("x")));
-            ctx.compute(&expr)
-                .and_then(|s| s.selectivity)
-                .expect("the comparison has a selectivity")
-        };
-        let both = selectivity(Operator::Eq) + selectivity(Operator::NotEq);
-        assert!((both - 0.5).abs() < 1e-9, "got {both}");
     }
 
     // `check_support` accepts `col0 > 50.0`, but the column statistics are
