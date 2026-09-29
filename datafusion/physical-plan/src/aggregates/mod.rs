@@ -195,6 +195,7 @@ use datafusion_expr::{Accumulator, Aggregate, AggregateMetrics};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::synopsis_registry::SynopsisContext;
 use datafusion_physical_expr::{
     ConstExpr, EquivalenceProperties, physical_exprs_contains,
 };
@@ -1626,9 +1627,9 @@ impl AggregateExec {
         &self,
         child_statistics: &Statistics,
         partition: Option<usize>,
+        synopsis_ctx: &SynopsisContext,
     ) -> Result<Statistics> {
         // TODO stats: group expressions:
-        // - once expressions will be able to compute their own stats, use it here
         // - case where we group by on a column for which with have the `distinct` stat
         // TODO stats: aggr expression:
         // - aggregations sometimes also preserve invariants such as min, max...
@@ -1662,7 +1663,8 @@ impl AggregateExec {
                 })
             }
             None => {
-                let num_rows = self.estimate_num_rows(child_statistics, partition);
+                let num_rows =
+                    self.estimate_num_rows(child_statistics, partition, synopsis_ctx);
                 let column_statistics = self.nullify_group_columns_for_empty_input(
                     column_statistics,
                     child_statistics,
@@ -1804,9 +1806,10 @@ impl AggregateExec {
         &self,
         child_statistics: &Statistics,
         partition: Option<usize>,
+        synopsis_ctx: &SynopsisContext,
     ) -> Precision<usize> {
         let ndv = if !self.group_by().expr.is_empty() {
-            self.compute_group_ndv(child_statistics)
+            self.compute_group_ndv(synopsis_ctx)
         } else {
             None
         };
@@ -1849,10 +1852,9 @@ impl AggregateExec {
 
     /// Computes the estimated number of distinct groups across all grouping sets.
     /// For each grouping set, computes `product(NDV_i + null_adj_i)` for active columns,
-    /// then sums across all sets. Returns `None` if any active column is not a direct
-    /// column reference or lacks `distinct_count` stats. Non-column expressions
-    /// (e.g. `abs(a)`) are not yet supported because expression-level statistics
-    /// propagation is still in progress (see <https://github.com/apache/datafusion/pull/21122>).
+    /// then sums across all sets. The NDV and null adjustment of each group
+    /// expression come from [`Self::group_expr_ndvs`]. Returns `None` if any active
+    /// column lacks NDV.
     /// When `null_count` is absent or unknown, null_adjustment defaults to 0.
     ///
     /// **Single key:** `GROUP BY a` where NDV(a) = 100, null_count(a) = 5
@@ -1864,27 +1866,43 @@ impl AggregateExec {
     /// **Grouping sets:** `GROUPING SETS ((a), (b), (a, b))` with NDV(a) = 100, NDV(b) = 50
     /// → set(a) = 100, set(b) = 50, set(a, b) = 100 × 50 = 5,000
     /// → total = 100 + 50 + 5,000 = 5,150
-    fn compute_group_ndv(&self, child_statistics: &Statistics) -> Option<usize> {
+    fn compute_group_ndv(&self, synopsis_ctx: &SynopsisContext) -> Option<usize> {
+        let expr_ndvs = self.group_expr_ndvs(synopsis_ctx);
         let mut total: usize = 0;
         for group_mask in &self.group_by().groups {
             let mut set_product: usize = 1;
-            for (j, (expr, _)) in self.group_by().expr.iter().enumerate() {
+            for j in 0..self.group_by().expr.len() {
                 if group_mask[j] {
                     continue;
                 }
-                let col = expr.downcast_ref::<Column>()?;
-                let col_stats = &child_statistics.column_statistics[col.index()];
-                let ndv = *col_stats.distinct_count.get_value()?;
-                let null_adjustment = match col_stats.null_count.get_value() {
-                    Some(&n) if n > 0 => 1usize,
-                    _ => 0,
-                };
+                let (ndv, null_adjustment) = expr_ndvs[j]?;
                 set_product = set_product
                     .saturating_mul(ndv.saturating_add(null_adjustment).max(1));
             }
             total = total.saturating_add(set_product);
         }
         Some(total)
+    }
+
+    /// The NDV and null adjustment of each GROUP BY expression, from its
+    /// synopsis. `null_adjustment` is 1 when the null count is known to be
+    /// positive, 0 otherwise.
+    fn group_expr_ndvs(
+        &self,
+        synopsis_ctx: &SynopsisContext,
+    ) -> Vec<Option<(usize, usize)>> {
+        self.group_by()
+            .expr
+            .iter()
+            .map(|(expr, _)| {
+                let column = synopsis_ctx.compute(expr)?.column;
+                let ndv = *column.distinct_count.get_value()?;
+                let null_adjustment = usize::from(
+                    matches!(column.null_count.get_value(), Some(&n) if n > 0),
+                );
+                Some((ndv, null_adjustment))
+            })
+            .collect()
     }
 
     /// Check if dynamic filter is possible for the current plan node.
@@ -2312,9 +2330,17 @@ impl ExecutionPlan for AggregateExec {
         args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
         let child_statistics = Arc::clone(&input_stats[0]);
-        Ok(Arc::new(
-            self.statistics_inner(&child_statistics, args.partition())?,
-        ))
+        let input_schema = self.input().schema();
+        let synopsis_ctx = SynopsisContext::new_with_registry(
+            &child_statistics,
+            input_schema.as_ref(),
+            args.synopsis_registry(),
+        );
+        Ok(Arc::new(self.statistics_inner(
+            &child_statistics,
+            args.partition(),
+            &synopsis_ctx,
+        )?))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {

@@ -2166,9 +2166,19 @@ mod tests {
 
     #[test]
     fn test_aggregate_provider_partial_delegates() -> Result<()> {
-        // Partial aggregates produce per-partition groups; the provider
-        // should delegate rather than applying global NDV bounds.
-        let source = make_source_with_ndv(100, vec![Some(10)]);
+        // Partial aggregates produce per-partition groups, so the provider
+        // delegates to the operator's own estimate. The group column has
+        // nulls, so the operator counts one more group than the provider's
+        // formula would: `min(100, 10 + 1) = 11` against `min(100, 10) = 10`.
+        let mut col_stats = ColumnStatistics::new_unknown();
+        col_stats.distinct_count = Precision::Exact(10);
+        col_stats.null_count = Precision::Exact(5);
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int32, true)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::with_column_stats(
+            schema,
+            Precision::Exact(100),
+            vec![col_stats],
+        ));
         let group_by = PhysicalGroupBy::new_single(vec![(
             Arc::new(Column::new("c0", 0)),
             "c0".to_string(),
@@ -2182,15 +2192,177 @@ mod tests {
             source.schema(),
         )?);
 
+        // The operator's own estimate, computed with no provider registered.
+        let empty_registry = StatisticsRegistry::new();
+        let operator_num_rows = compute(&empty_registry, agg.as_ref())?.base.num_rows;
+        assert_eq!(operator_num_rows, Precision::Inexact(11));
+
         let registry = StatisticsRegistry::with_providers(vec![Arc::new(
             AggregateStatisticsProvider,
         )]);
         let stats = compute(&registry, agg.as_ref())?;
-        // Should fall through to the operator's built-in statistics_from_inputs.
-        // The exact value depends on the built-in implementation.
-        assert!(
-            stats.base.num_rows.get_value().is_some()
-                || matches!(stats.base.num_rows, Precision::Absent)
+        assert_eq!(stats.base.num_rows, operator_num_rows);
+        Ok(())
+    }
+
+    /// Supplies an exact distinct count of 42 for any `+` expression.
+    #[derive(Debug)]
+    struct SumNdvSynopsis;
+
+    impl SynopsisProvider for SumNdvSynopsis {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            if *binary.op() == Operator::Plus {
+                let column = ColumnStatistics {
+                    distinct_count: Precision::Exact(42),
+                    ..ColumnStatistics::new_unknown()
+                };
+                SynopsisResult::Computed(ExprSynopsis::from_column(
+                    column,
+                    DataType::Int32,
+                ))
+            } else {
+                SynopsisResult::Delegate
+            }
+        }
+    }
+
+    /// With no `StatisticsProvider` registered, `AggregateExec` itself takes
+    /// the distinct count of a GROUP BY expression that is not a bare column
+    /// from a registered `SynopsisProvider`.
+    #[test]
+    fn test_aggregate_operator_direct_synopsis_consumption() -> Result<()> {
+        let source = make_source_with_ndv(200, vec![None, None]);
+        let group_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c0", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("c1", 1)),
+        ));
+        let group_by = PhysicalGroupBy::new_single(vec![(group_expr, "sum".to_string())]);
+        let agg = make_aggregate(source, group_by)?;
+
+        // The empty statistics registry leaves the estimate to the operator.
+        let registry = StatisticsRegistry::new();
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(SumNdvSynopsis)]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(agg.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        assert_eq!(
+            stats.base.num_rows,
+            Precision::Inexact(42),
+            "row estimate comes from the synopsis-supplied NDV, not the input row count"
+        );
+        Ok(())
+    }
+
+    /// With no provider of either kind registered, `AggregateExec` estimates a
+    /// GROUP BY expression with the built-in rules.
+    #[test]
+    fn test_aggregate_group_expression_uses_built_in_rules() -> Result<()> {
+        let source = make_source_with_ndv(200, vec![Some(10)]);
+        let group_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c0", 0)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+        ));
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(group_expr, "c0_plus_1".to_string())]);
+        let agg = make_aggregate(source, group_by)?;
+
+        let stats =
+            StatisticsContext::new().compute(agg.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        Ok(())
+    }
+
+    /// An `AggregateExec` below the root still reads the synopsis registry,
+    /// because the walk passes the registry down to every operator.
+    #[test]
+    fn test_synopsis_registry_reaches_an_operator_below_the_root() -> Result<()> {
+        let source = make_source_with_ndv(200, vec![None, None]);
+        let group_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c0", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("c1", 1)),
+        ));
+        let group_by = PhysicalGroupBy::new_single(vec![(group_expr, "sum".to_string())]);
+        let agg = make_aggregate(source, group_by)?;
+        let agg_schema = agg.schema();
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            vec![(col("sum", &agg_schema)?, "sum".to_string())],
+            agg,
+        )?);
+
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(SumNdvSynopsis)]);
+        let stats = StatisticsContext::new_with_registry(StatisticsRegistry::new())
+            .with_synopsis_registry(synopsis_registry)
+            .compute(projection.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(42),
+            "the aggregate below the root takes its group count from the provider"
+        );
+        Ok(())
+    }
+
+    /// With both a `StatisticsProvider` and a `SynopsisProvider` registered,
+    /// the `StatisticsProvider`'s row count is the result.
+    #[test]
+    fn test_aggregate_provider_takes_precedence_over_synopsis() -> Result<()> {
+        #[derive(Debug)]
+        struct FixedAggregateRowCount(usize);
+
+        impl StatisticsProvider for FixedAggregateRowCount {
+            fn matches(&self, plan: &dyn ExecutionPlan) -> bool {
+                plan.downcast_ref::<AggregateExec>().is_some()
+            }
+
+            fn compute_statistics(
+                &self,
+                plan: &dyn ExecutionPlan,
+                child_stats: &[ExtendedStatistics],
+            ) -> Result<StatisticsResult> {
+                computed_with_row_count(plan, Precision::Exact(self.0), child_stats)
+            }
+        }
+
+        let source = make_source_with_ndv(200, vec![None, None]);
+        let group_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c0", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("c1", 1)),
+        ));
+        let group_by = PhysicalGroupBy::new_single(vec![(group_expr, "sum".to_string())]);
+        let agg = make_aggregate(source, group_by)?;
+
+        let registry = StatisticsRegistry::with_providers(vec![Arc::new(
+            FixedAggregateRowCount(777),
+        )]);
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(SumNdvSynopsis)]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(agg.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        assert_eq!(
+            stats.base.num_rows,
+            Precision::Exact(777),
+            "the StatisticsProvider's row count is the result"
         );
         Ok(())
     }
