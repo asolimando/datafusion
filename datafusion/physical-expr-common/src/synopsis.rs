@@ -70,19 +70,43 @@ impl ExprSynopsis {
     /// The synopsis of a constant: one distinct value, which is both the
     /// minimum and the maximum. A literal produces one value per input row,
     /// so a NULL constant's `null_count` is `num_rows`; otherwise it is 0.
+    /// The sum is the value times `num_rows`, and the byte size is the width
+    /// of a primitive type times `num_rows`. A NULL constant occupies no bytes.
     pub fn literal(value: ScalarValue, num_rows: Precision<usize>) -> Self {
         let data_type = value.data_type();
-        let null_count = if value.is_null() {
-            num_rows
+        let column = if value.is_null() {
+            ColumnStatistics {
+                null_count: num_rows,
+                max_value: Precision::Exact(value.clone()),
+                min_value: Precision::Exact(value.clone()),
+                sum_value: Precision::Exact(value),
+                distinct_count: Precision::Exact(1),
+                byte_size: Precision::Exact(0),
+            }
         } else {
-            Precision::Exact(0)
-        };
-        let column = ColumnStatistics {
-            null_count,
-            max_value: Precision::Exact(value.clone()),
-            min_value: Precision::Exact(value),
-            distinct_count: Precision::Exact(1),
-            ..ColumnStatistics::new_unknown()
+            let byte_size = data_type
+                .primitive_width()
+                .map_or(Precision::Absent, |width| {
+                    num_rows.multiply(&Precision::Exact(width))
+                });
+            let widened_sum = Precision::Exact(value.clone()).cast_to_sum_type();
+            let sum_value = widened_sum
+                .get_value()
+                .and_then(|sum| {
+                    Precision::<ScalarValue>::from(num_rows)
+                        .cast_to(&sum.data_type())
+                        .ok()
+                })
+                .map(|row_count| widened_sum.multiply(&row_count))
+                .unwrap_or(Precision::Absent);
+            ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(value.clone()),
+                min_value: Precision::Exact(value),
+                sum_value,
+                distinct_count: Precision::Exact(1),
+                byte_size,
+            }
         };
         Self {
             column,

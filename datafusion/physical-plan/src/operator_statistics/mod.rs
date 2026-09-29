@@ -2124,6 +2124,85 @@ mod tests {
         Ok(())
     }
 
+    /// A projection expression that is neither a `Column` nor a `Literal`
+    /// (`a + b`) gets its `distinct_count`, `min_value`, `max_value`, and
+    /// `null_count` from a `SynopsisProvider`-supplied synopsis, through
+    /// `ProjectionExec::statistics_from_inputs`.
+    #[test]
+    fn test_projection_synopsis_populates_column_stats() -> Result<()> {
+        #[derive(Debug)]
+        struct SumSynopsis;
+
+        impl SynopsisProvider for SumSynopsis {
+            fn compute_synopsis(
+                &self,
+                expr: &Arc<dyn PhysicalExpr>,
+                _ctx: &SynopsisContext,
+            ) -> SynopsisResult {
+                let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                    return SynopsisResult::Delegate;
+                };
+                if *binary.op() == Operator::Plus {
+                    let column = ColumnStatistics {
+                        distinct_count: Precision::Exact(7),
+                        min_value: Precision::Exact(ScalarValue::Int32(Some(10))),
+                        max_value: Precision::Exact(ScalarValue::Int32(Some(90))),
+                        null_count: Precision::Exact(250),
+                        ..ColumnStatistics::new_unknown()
+                    };
+                    SynopsisResult::Computed(ExprSynopsis::from_column(
+                        column,
+                        DataType::Int32,
+                    ))
+                } else {
+                    SynopsisResult::Delegate
+                }
+            }
+        }
+
+        let schema = make_schema(); // "a" Int32, "b" Int32
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::new(
+            Arc::clone(&schema),
+            Precision::Exact(1000),
+        ));
+
+        let sum_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("a", &schema)?,
+            Operator::Plus,
+            col("b", &schema)?,
+        ));
+        let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            vec![(sum_expr, "sum_ab".to_string())],
+            source,
+        )?);
+
+        let registry = StatisticsRegistry::new();
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(SumSynopsis)]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(proj.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        let col_stats = &stats.base.column_statistics[0];
+        assert_eq!(col_stats.distinct_count, Precision::Exact(7));
+        assert_eq!(
+            col_stats.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(10)))
+        );
+        assert_eq!(
+            col_stats.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(90)))
+        );
+        assert_eq!(
+            col_stats.null_count,
+            Precision::Exact(250),
+            "null_count comes directly from the provider's column statistics"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_passthrough_statistics_propagation() -> Result<()> {
         use crate::coalesce_partitions::CoalescePartitionsExec;

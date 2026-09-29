@@ -17,12 +17,14 @@
 
 //! [`ProjectionExpr`] and [`ProjectionExprs`] for representing projections.
 
+use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
 use crate::expressions::{CastExpr, Column, Literal};
 use crate::scalar_function::ScalarFunctionExpr;
+use crate::synopsis_registry::SynopsisContext;
 use crate::utils::collect_columns;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
@@ -38,6 +40,7 @@ use datafusion_physical_expr_common::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_expr_common::metrics::ExpressionEvaluatorMetrics;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr_common::synopsis::ExprSynopsis;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays_with_metrics;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -714,7 +717,7 @@ impl ProjectionExprs {
         stats: Statistics,
         output_schema: &Schema,
     ) -> Result<Statistics> {
-        self.project_statistics_impl(stats, None, output_schema)
+        self.project_statistics_impl(stats, None, output_schema, None)
     }
 
     /// Projects `stats` using `input_schema` to identify safe casts even when
@@ -725,7 +728,26 @@ impl ProjectionExprs {
         input_schema: &Schema,
         output_schema: &Schema,
     ) -> Result<Statistics> {
-        self.project_statistics_impl(stats, Some(input_schema), output_schema)
+        self.project_statistics_impl(stats, Some(input_schema), output_schema, None)
+    }
+
+    /// Same as [`Self::project_statistics_with_input_schema`], refining the
+    /// statistics of an expression that is neither a [`Column`] nor a
+    /// [`Literal`] with its synopsis: an `Exact` value from the projection is
+    /// kept, and any other value is replaced by the synopsis's value when known.
+    pub fn project_statistics_with_synopses(
+        &self,
+        stats: Statistics,
+        input_schema: &Schema,
+        output_schema: &Schema,
+        synopsis_ctx: Option<&SynopsisContext>,
+    ) -> Result<Statistics> {
+        self.project_statistics_impl(
+            stats,
+            Some(input_schema),
+            output_schema,
+            synopsis_ctx,
+        )
     }
 
     fn project_statistics_impl(
@@ -733,6 +755,7 @@ impl ProjectionExprs {
         mut stats: Statistics,
         input_schema: Option<&Schema>,
         output_schema: &Schema,
+        synopsis_ctx: Option<&SynopsisContext>,
     ) -> Result<Statistics> {
         let mut column_statistics = Vec::with_capacity(self.exprs.len());
 
@@ -741,62 +764,29 @@ impl ProjectionExprs {
             let col_stats = if let Some(col) = expr.downcast_ref::<Column>() {
                 column_statistics_at(&stats.column_statistics, col.index())
             } else if let Some(literal) = expr.downcast_ref::<Literal>() {
-                // Handle literal expressions (constants) by calculating proper statistics
-                let data_type = expr.data_type(output_schema)?;
-
-                if literal.value().is_null() {
-                    let null_count = match stats.num_rows {
-                        Precision::Exact(num_rows) => Precision::Exact(num_rows),
-                        _ => Precision::Absent,
-                    };
-
-                    ColumnStatistics {
-                        min_value: Precision::Exact(literal.value().clone()),
-                        max_value: Precision::Exact(literal.value().clone()),
-                        distinct_count: Precision::Exact(1),
-                        null_count,
-                        sum_value: Precision::Exact(literal.value().clone()),
-                        byte_size: Precision::Exact(0),
-                    }
-                } else {
-                    let value = literal.value();
-                    let distinct_count = Precision::Exact(1);
-                    let null_count = Precision::Exact(0);
-
-                    let byte_size = if let Some(byte_width) = data_type.primitive_width()
-                    {
-                        stats.num_rows.multiply(&Precision::Exact(byte_width))
-                    } else {
-                        // Complex types depend on array encoding, so set to Absent
-                        Precision::Absent
-                    };
-
-                    let widened_sum = Precision::Exact(value.clone()).cast_to_sum_type();
-                    let sum_value = widened_sum
-                        .get_value()
-                        .and_then(|sum| {
-                            Precision::<ScalarValue>::from(stats.num_rows)
-                                .cast_to(&sum.data_type())
-                                .ok()
-                        })
-                        .map(|row_count| widened_sum.multiply(&row_count))
-                        .unwrap_or(Precision::Absent);
-
-                    ColumnStatistics {
-                        min_value: Precision::Exact(value.clone()),
-                        max_value: Precision::Exact(value.clone()),
-                        distinct_count,
-                        null_count,
-                        sum_value,
-                        byte_size,
-                    }
-                }
+                ExprSynopsis::literal(literal.value().clone(), stats.num_rows).column
             } else {
-                project_column_statistics_through_expr(
+                let projected = project_column_statistics_through_expr(
                     expr.as_ref(),
                     &stats.column_statistics,
                     input_schema,
-                )
+                );
+                match synopsis_ctx.and_then(|ctx| ctx.compute(expr)) {
+                    Some(synopsis) => ColumnStatistics {
+                        distinct_count: refine(
+                            projected.distinct_count,
+                            synopsis.column.distinct_count,
+                        ),
+                        min_value: refine(projected.min_value, synopsis.column.min_value),
+                        max_value: refine(projected.max_value, synopsis.column.max_value),
+                        null_count: refine(
+                            projected.null_count,
+                            synopsis.column.null_count,
+                        ),
+                        ..projected
+                    },
+                    None => projected,
+                }
             };
             column_statistics.push(col_stats);
         }
@@ -857,6 +847,18 @@ impl ProjectionExprs {
                 .downcast_ref::<Column>()
                 .is_some_and(|projected| projected == column)
         })
+    }
+}
+
+/// Keeps an `Exact` value from the generic projection; otherwise takes the
+/// synopsis's value when it is known.
+fn refine<T>(projected: Precision<T>, synopsis: Precision<T>) -> Precision<T>
+where
+    T: Debug + Clone + PartialEq + Eq + PartialOrd,
+{
+    match (&projected, &synopsis) {
+        (Precision::Exact(_), _) | (_, Precision::Absent) => projected,
+        _ => synopsis,
     }
 }
 

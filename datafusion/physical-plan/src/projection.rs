@@ -54,6 +54,7 @@ use datafusion_expr::ExpressionPlacement;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
+use datafusion_physical_expr::synopsis_registry::SynopsisContext;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexRequirement, PhysicalSortExpr,
@@ -485,19 +486,28 @@ impl ExecutionPlan for ProjectionExec {
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
         let input_stats = input_stats[0].as_ref().clone();
+        let input_schema = self.input.schema();
         let output_schema = self.schema();
-        Ok(Arc::new(
-            self.projector
-                .projection()
-                .project_statistics_with_input_schema(
-                    input_stats,
-                    self.input.schema().as_ref(),
-                    &output_schema,
-                )?,
-        ))
+
+        let synopsis_ctx = SynopsisContext::new_with_registry(
+            &input_stats,
+            input_schema.as_ref(),
+            args.synopsis_registry(),
+        );
+
+        let stats = self
+            .projector
+            .projection()
+            .project_statistics_with_synopses(
+                input_stats.clone(),
+                input_schema.as_ref(),
+                &output_schema,
+                Some(&synopsis_ctx),
+            )?;
+        Ok(Arc::new(stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
