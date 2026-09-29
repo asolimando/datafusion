@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -64,13 +62,18 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, InListExpr, IsNotNullExpr, Literal, lit,
+    BinaryExpr, Column, InListExpr, Literal, lit,
+};
+use datafusion_physical_expr::filter_statistics::{
+    collect_equality_columns, collect_null_rejecting_columns,
+    column_statistics_from_boundaries, column_statistics_from_selectivity,
+    scale_byte_size_at_rows,
 };
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
-    conjunction, split_conjunction,
+    AcrossPartitions, AnalysisContext, ConstExpr, PhysicalExpr, analyze, conjunction,
+    split_conjunction,
 };
 
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -404,14 +407,21 @@ impl FilterExec {
                 let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
                 let filtered_num_rows =
                     input_num_rows.with_estimated_selectivity(selectivity);
-                let cs = collect_new_statistics(
-                    schema,
-                    &input_stats.column_statistics,
-                    analysis_ctx.boundaries,
-                    selectivity,
-                    &null_rejecting_columns,
-                    filtered_num_rows,
-                );
+                let cs = analysis_ctx
+                    .boundaries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, boundaries)| {
+                        column_statistics_from_boundaries(
+                            schema.field(idx).data_type(),
+                            &input_stats.column_statistics[idx],
+                            boundaries,
+                            selectivity,
+                            null_rejecting_columns.contains(&idx),
+                            filtered_num_rows,
+                        )
+                    })
+                    .collect();
                 (selectivity, filtered_num_rows, cs)
             } else {
                 // Without interval boundaries, use the default selectivity and
@@ -420,24 +430,20 @@ impl FilterExec {
                 let selectivity = default_selectivity as f64 / 100.0;
                 let filtered_num_rows =
                     input_num_rows.with_estimated_selectivity(selectivity);
-                let mut cs = input_stats.to_inexact().column_statistics;
-                for (idx, col_stat) in cs.iter_mut().enumerate() {
-                    col_stat.byte_size = scale_byte_size_at_rows(
-                        col_stat.byte_size,
-                        selectivity,
-                        filtered_num_rows,
-                    );
-                    col_stat.null_count = if null_rejecting_columns.contains(&idx) {
-                        Precision::Exact(0)
-                    } else {
-                        cap_at_rows(col_stat.null_count, filtered_num_rows)
-                    };
-                    col_stat.distinct_count = if eq_columns.contains(&idx) {
-                        distinct_count_for_singleton_domain(filtered_num_rows)
-                    } else {
-                        cap_at_rows(col_stat.distinct_count, filtered_num_rows)
-                    };
-                }
+                let cs = input_stats
+                    .column_statistics
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col_stat)| {
+                        column_statistics_from_selectivity(
+                            col_stat,
+                            selectivity,
+                            null_rejecting_columns.contains(&idx),
+                            eq_columns.contains(&idx),
+                            filtered_num_rows,
+                        )
+                    })
+                    .collect();
                 (selectivity, filtered_num_rows, cs)
             }
         };
@@ -1107,246 +1113,6 @@ fn holds_each_value_once(column: &ColumnStatistics, num_rows: &Precision<usize>)
         return false;
     };
     distinct.saturating_add(*nulls) >= *rows
-}
-
-/// Collects column equality information from `col = literal` predicates in a
-/// conjunction.
-///
-/// Returns `(eq_columns, is_infeasible)`:
-/// - `eq_columns`: set of column indices constrained to a single literal value.
-/// - `is_infeasible`: `true` when the same column is equated to two different
-///   non-null literals (e.g. `name = 'alice' AND name = 'bob'`), which is
-///   always unsatisfiable.
-///
-/// Only AND conjunctions are traversed; OR is intentionally skipped
-/// since `a = 1 OR a = 2` does not pin NDV to 1.
-fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize>, bool) {
-    let mut eq_values: HashMap<usize, ScalarValue> = HashMap::new();
-    let mut infeasible = false;
-
-    for expr in split_conjunction(predicate) {
-        let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
-            continue;
-        };
-        if *binary.op() != Operator::Eq {
-            continue;
-        }
-        let left = binary.left();
-        let right = binary.right();
-        let pair = if let Some(col) = left.downcast_ref::<Column>()
-            && let Some(lit) = right.downcast_ref::<Literal>()
-            && !lit.value().is_null()
-        {
-            Some((col.index(), lit.value().clone()))
-        } else if let Some(col) = right.downcast_ref::<Column>()
-            && let Some(lit) = left.downcast_ref::<Literal>()
-            && !lit.value().is_null()
-        {
-            Some((col.index(), lit.value().clone()))
-        } else {
-            None
-        };
-
-        if let Some((idx, value)) = pair {
-            match eq_values.entry(idx) {
-                Entry::Occupied(prev) => {
-                    if *prev.get() != value {
-                        infeasible = true;
-                        break;
-                    }
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert(value);
-                }
-            }
-        }
-    }
-
-    (eq_values.into_keys().collect(), infeasible)
-}
-
-/// Collects columns that cannot be NULL in any surviving row.
-///
-/// A filter keeps only rows where the predicate is TRUE, so a column is
-/// null-rejecting if some top-level AND conjunct evaluates to NULL or FALSE
-/// whenever that column is NULL. Two such conjuncts are recognized:
-///
-/// - a binary operator that returns NULL on NULL input, applied directly to the
-///   column (e.g. `a = 10`, `a < b`);
-/// - an `IS NOT NULL` check on the column (e.g. `a IS NOT NULL`).
-///
-/// This analysis is conservative; for example, OR clauses are not considered
-/// null-rejecting, and neither are indirect operands like `a + 1 < 10`.
-fn collect_null_rejecting_columns(predicate: &Arc<dyn PhysicalExpr>) -> HashSet<usize> {
-    let mut columns = HashSet::new();
-
-    for expr in split_conjunction(predicate) {
-        // `col IS NOT NULL` keeps only rows where `col` is non-null.
-        if let Some(is_not_null) = expr.downcast_ref::<IsNotNullExpr>() {
-            if let Some(col) = is_not_null.arg().downcast_ref::<Column>() {
-                columns.insert(col.index());
-            }
-            continue;
-        }
-
-        // A binary operator that returns NULL on NULL input rejects rows where
-        // a direct column operand is NULL.
-        if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
-            if !binary.op().returns_null_on_null() {
-                continue;
-            }
-            if let Some(col) = binary.left().downcast_ref::<Column>() {
-                columns.insert(col.index());
-            }
-            if let Some(col) = binary.right().downcast_ref::<Column>() {
-                columns.insert(col.index());
-            }
-        }
-    }
-
-    columns
-}
-
-/// Converts an interval bound to a [`Precision`] value. NULL bounds (which
-/// represent "unbounded" in the interval type) map to [`Precision::Absent`].
-fn interval_bound_to_precision(
-    bound: ScalarValue,
-    is_exact: bool,
-) -> Precision<ScalarValue> {
-    if bound.is_null() {
-        Precision::Absent
-    } else if is_exact {
-        Precision::Exact(bound)
-    } else {
-        Precision::Inexact(bound)
-    }
-}
-
-/// Caps a row-bounded column statistic (a null count or distinct count) at the
-/// filtered row count, since a column cannot have more nulls or distinct values
-/// than it has rows. Known counts are demoted to inexact because a
-/// filter-derived row bound is normally an estimate, the exception being an
-/// exact zero, which proves the column is empty.
-fn cap_at_rows(
-    value: Precision<usize>,
-    filtered_num_rows: Precision<usize>,
-) -> Precision<usize> {
-    match filtered_num_rows {
-        Precision::Absent => value.to_inexact(),
-        Precision::Exact(0) => Precision::Exact(0),
-        rows => value.to_inexact().min(&rows),
-    }
-}
-
-/// Scales a byte size by the filter selectivity. An exact zero row count means
-/// the output is exactly empty, so the byte size is an exact zero too.
-fn scale_byte_size_at_rows(
-    byte_size: Precision<usize>,
-    selectivity: f64,
-    filtered_num_rows: Precision<usize>,
-) -> Precision<usize> {
-    if filtered_num_rows == Precision::Exact(0) {
-        Precision::Exact(0)
-    } else {
-        byte_size.with_estimated_selectivity(selectivity)
-    }
-}
-
-/// Returns the NDV for a column constrained to one non-null value (e.g.
-/// `column = literal` or a singleton interval), derived from the filtered row
-/// estimate: zero rows means zero distinct values, a known positive row count
-/// means exactly one, and an unknown row count means an inexact one (the column
-/// could still be empty).
-///
-/// The caller is responsible for proving the singleton domain.
-fn distinct_count_for_singleton_domain(
-    filtered_num_rows: Precision<usize>,
-) -> Precision<usize> {
-    match filtered_num_rows {
-        Precision::Exact(0) | Precision::Inexact(0) => filtered_num_rows,
-        // The row count is unknown, so the column could still be empty (zero
-        // distinct values); report an inexact one rather than overstating it.
-        Precision::Absent => Precision::Inexact(1),
-        _ => Precision::Exact(1),
-    }
-}
-
-/// Builds output column statistics from interval-analysis boundaries.
-///
-/// The interval bounds become min/max values, singleton intervals become
-/// singleton NDV, and row-bounded counts are kept consistent with the filtered
-/// row estimate.
-fn collect_new_statistics(
-    schema: &SchemaRef,
-    input_column_stats: &[ColumnStatistics],
-    analysis_boundaries: Vec<ExprBoundaries>,
-    selectivity: f64,
-    null_rejecting_columns: &HashSet<usize>,
-    filtered_num_rows: Precision<usize>,
-) -> Vec<ColumnStatistics> {
-    analysis_boundaries
-        .into_iter()
-        .enumerate()
-        .map(
-            |(
-                idx,
-                ExprBoundaries {
-                    interval,
-                    distinct_count,
-                    ..
-                },
-            )| {
-                let Some(interval) = interval else {
-                    // If the interval is `None`, we can say that there are no rows.
-                    // Use a typed null to preserve the column's data type, so that
-                    // downstream interval analysis can still intersect intervals
-                    // of the same type.
-                    let typed_null = ScalarValue::try_from(schema.field(idx).data_type())
-                        .unwrap_or(ScalarValue::Null);
-                    return ColumnStatistics {
-                        null_count: Precision::Exact(0),
-                        max_value: Precision::Exact(typed_null.clone()),
-                        min_value: Precision::Exact(typed_null.clone()),
-                        sum_value: Precision::Exact(typed_null),
-                        distinct_count: Precision::Exact(0),
-                        byte_size: Precision::Exact(0),
-                    };
-                };
-                let (lower, upper) = interval.into_bounds();
-                let is_single_value =
-                    !lower.is_null() && !upper.is_null() && lower == upper;
-                let min_value = interval_bound_to_precision(lower, is_single_value);
-                let max_value = interval_bound_to_precision(upper, is_single_value);
-
-                // Distinct and null counts cannot exceed the number of rows
-                // that survive the filter. Singleton intervals and
-                // null-rejecting predicates provide tighter bounds.
-                let capped_distinct_count = if is_single_value {
-                    distinct_count_for_singleton_domain(filtered_num_rows)
-                } else {
-                    cap_at_rows(distinct_count, filtered_num_rows)
-                };
-                let capped_null_count = if null_rejecting_columns.contains(&idx) {
-                    Precision::Exact(0)
-                } else {
-                    cap_at_rows(input_column_stats[idx].null_count, filtered_num_rows)
-                };
-                let byte_size = scale_byte_size_at_rows(
-                    input_column_stats[idx].byte_size,
-                    selectivity,
-                    filtered_num_rows,
-                );
-                ColumnStatistics {
-                    null_count: capped_null_count,
-                    max_value,
-                    min_value,
-                    sum_value: Precision::Absent,
-                    distinct_count: capped_distinct_count,
-                    byte_size,
-                }
-            },
-        )
-        .collect()
 }
 
 /// The FilterExec streams wraps the input iterator and applies the predicate expression to
@@ -3769,211 +3535,6 @@ mod tests {
             Precision::Exact(1)
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_collect_equality_columns() {
-        use std::collections::HashSet;
-        // (description, predicate, expected_column_indices, expected_infeasible)
-        #[expect(clippy::type_complexity)]
-        let cases: Vec<(&str, Arc<dyn PhysicalExpr>, Vec<usize>, bool)> = vec![
-            (
-                "simple col = literal",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Column::new("a", 0)),
-                    Operator::Eq,
-                    Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                )),
-                vec![0],
-                false,
-            ),
-            (
-                "reversed literal = col",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    Operator::Eq,
-                    Arc::new(Column::new("a", 0)),
-                )),
-                vec![0],
-                false,
-            ),
-            (
-                "AND with two equalities",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    )),
-                    Operator::And,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("b", 1)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                            "hello".to_string(),
-                        )))),
-                    )),
-                )),
-                vec![0, 1],
-                false,
-            ),
-            (
-                "OR produces empty set",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    )),
-                    Operator::Or,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(99)))),
-                    )),
-                )),
-                vec![],
-                false,
-            ),
-            (
-                "greater-than produces empty set",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Column::new("a", 0)),
-                    Operator::Gt,
-                    Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                )),
-                vec![],
-                false,
-            ),
-            (
-                "col = col produces empty set",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Column::new("a", 0)),
-                    Operator::Eq,
-                    Arc::new(Column::new("b", 1)),
-                )),
-                vec![],
-                false,
-            ),
-            (
-                "nested AND with three equalities",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(BinaryExpr::new(
-                            Arc::new(Column::new("a", 0)),
-                            Operator::Eq,
-                            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
-                        )),
-                        Operator::And,
-                        Arc::new(BinaryExpr::new(
-                            Arc::new(Column::new("b", 1)),
-                            Operator::Eq,
-                            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))),
-                        )),
-                    )),
-                    Operator::And,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("c", 2)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(3)))),
-                    )),
-                )),
-                vec![0, 1, 2],
-                false,
-            ),
-            (
-                "AND with mixed equality and non-equality",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    )),
-                    Operator::And,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("b", 1)),
-                        Operator::Gt,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
-                    )),
-                )),
-                vec![0],
-                false,
-            ),
-            (
-                "col = NULL is excluded",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Column::new("a", 0)),
-                    Operator::Eq,
-                    Arc::new(Literal::new(ScalarValue::Int32(None))),
-                )),
-                vec![],
-                false,
-            ),
-            (
-                "NULL = col is excluded",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(Literal::new(ScalarValue::Utf8(None))),
-                    Operator::Eq,
-                    Arc::new(Column::new("a", 0)),
-                )),
-                vec![],
-                false,
-            ),
-            (
-                "contradictory: same col, different literals",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                            "alice".to_string(),
-                        )))),
-                    )),
-                    Operator::And,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                            "bob".to_string(),
-                        )))),
-                    )),
-                )),
-                vec![0],
-                true,
-            ),
-            (
-                "same col, same literal is not contradictory",
-                Arc::new(BinaryExpr::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    )),
-                    Operator::And,
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("a", 0)),
-                        Operator::Eq,
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
-                    )),
-                )),
-                vec![0],
-                false,
-            ),
-        ];
-
-        for (desc, expr, expected_cols, expected_infeasible) in cases {
-            let (result, infeasible) = collect_equality_columns(&expr);
-            let expected: HashSet<usize> = expected_cols.into_iter().collect();
-            if expected_infeasible {
-                // When infeasible, the scan is short-circuited, so we only
-                // assert the infeasibility flag — the partial column set
-                // contents are an implementation detail.
-                assert!(infeasible, "case '{desc}': expected infeasible");
-            } else {
-                assert_eq!(result, expected, "case '{desc}': columns mismatch");
-                assert!(!infeasible, "case '{desc}': expected feasible");
-            }
-        }
     }
 
     /// Regression test: ProjectionExec on top of a FilterExec that already has

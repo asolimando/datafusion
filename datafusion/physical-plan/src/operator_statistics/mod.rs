@@ -509,37 +509,7 @@ pub fn num_distinct_vals(domain_size: usize, num_selected: usize) -> usize {
     result.clamp(1, domain_size)
 }
 
-/// Estimate NDV after applying a selectivity factor (filtering).
-///
-/// When filtering rows, each distinct value has multiple rows. If a value
-/// appears `k` times, the probability it survives the filter is `1 - (1-s)^k`
-/// where `s` is the selectivity.
-///
-/// Assuming uniform distribution (each value appears `rows/ndv` times):
-/// ```text
-/// NDV_after ~ NDV_before * [1 - (1 - selectivity)^(rows/NDV)]
-/// ```
-pub fn ndv_after_selectivity(
-    original_ndv: usize,
-    original_rows: usize,
-    selectivity: f64,
-) -> usize {
-    if selectivity <= 0.0 || original_ndv == 0 || original_rows == 0 {
-        return 0;
-    }
-    if selectivity >= 1.0 {
-        return original_ndv;
-    }
-
-    let ndv = original_ndv as f64;
-    let rows = original_rows as f64;
-
-    let rows_per_value = rows / ndv;
-    let survival_prob = 1.0 - (1.0 - selectivity).powf(rows_per_value);
-    let expected_ndv = ndv * survival_prob;
-
-    (expected_ndv.round() as usize).clamp(1, original_ndv)
-}
+pub use datafusion_physical_expr::filter_statistics::ndv_after_selectivity;
 
 /// Rescale `total_byte_size` proportionally after overriding `num_rows`.
 ///
