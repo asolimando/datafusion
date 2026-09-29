@@ -99,7 +99,7 @@ pub fn collect_equality_columns(
 ///
 /// This analysis is conservative; for example, OR clauses are not considered
 /// null-rejecting, and neither are indirect operands like `a + 1 < 10`.
-pub fn collect_null_rejecting_columns(
+pub(crate) fn collect_null_rejecting_columns(
     predicate: &Arc<dyn PhysicalExpr>,
 ) -> HashSet<usize> {
     let mut columns = HashSet::new();
@@ -262,7 +262,7 @@ pub(crate) fn distinct_count_after_filter(
 /// singleton distinct count, and row-bounded counts are kept consistent with
 /// the filtered row estimate. `data_type` is the column's type, used for the
 /// typed nulls of an empty column.
-pub fn column_statistics_from_boundaries(
+pub(crate) fn column_statistics_from_boundaries(
     data_type: &DataType,
     input: &ColumnStatistics,
     boundaries: ExprBoundaries,
@@ -327,7 +327,7 @@ pub fn column_statistics_from_boundaries(
 /// consistent with the filtered row estimate, a column constrained to one
 /// value (`single_value`) gets a singleton distinct count, and a
 /// null-rejecting column gets a null count of 0.
-pub fn column_statistics_from_selectivity(
+pub(crate) fn column_statistics_from_selectivity(
     input: &ColumnStatistics,
     selectivity: f64,
     null_rejecting: bool,

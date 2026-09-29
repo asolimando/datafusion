@@ -23,11 +23,10 @@
 //!
 //! `(SELECT user_id FROM events WHERE amount < 50 GROUP BY user_id) JOIN dims`: a
 //! provider supplies the column stats a catalog knows (`amount` range, `user_id`
-//! distinct count); the built-in `FilterStatisticsProvider` then refines the
-//! post-filter distinct count with the survival formula
-//! `NDV * (1 - (1 - selectivity)^(rows / NDV))` (Yao/Cardenas) to ~32, below `dims`
-//! (48), flipping the join build side. Core's simpler `min(NDV, rows)` cap would
-//! give 50 (> 48) and keep the other order; the refinement is the point. The
+//! distinct count); `FilterExec` then reduces the post-filter distinct count with
+//! the survival formula `NDV * (1 - (1 - selectivity)^(rows / NDV))`
+//! (Yao/Cardenas) to ~32, below `dims` (48), flipping the join build side. A plain
+//! `min(NDV, rows)` cap would give 50 (> 48) and keep the other order. The
 //! ground-truth query prints the true surviving distinct count (below 48),
 //! confirming the flip.
 
@@ -166,7 +165,7 @@ pub async fn join_reorder() -> Result<()> {
     println!(
         "A hash join builds its in-memory hash table from one input and probes with\n\
          the other, so the smaller input should be the build side. Default estimation\n\
-         sizes the grouped `events` at 1000 rows and builds from `dims`; the\n\
+         sizes the grouped `events` above `dims` and builds from `dims`; the\n\
          registry's refined ~32 estimate is below `dims` (48 rows), so it flips the\n\
          build side to `events`. The ground-truth count above (also below 48)\n\
          confirms `events` really is the smaller, cheaper side.\n"

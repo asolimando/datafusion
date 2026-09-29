@@ -65,15 +65,12 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, InListExpr, Literal, lit,
 };
 use datafusion_physical_expr::filter_statistics::{
-    collect_equality_columns, collect_null_rejecting_columns,
-    column_statistics_from_boundaries, column_statistics_from_selectivity,
-    scale_byte_size_at_rows,
+    collect_equality_columns, scale_byte_size_at_rows,
 };
-use datafusion_physical_expr::intervals::utils::check_support;
+use datafusion_physical_expr::synopsis_registry::{SynopsisContext, SynopsisRegistry};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    AcrossPartitions, AnalysisContext, ConstExpr, PhysicalExpr, analyze, conjunction,
-    split_conjunction,
+    AcrossPartitions, ConstExpr, PhysicalExpr, conjunction, split_conjunction,
 };
 
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -348,45 +345,26 @@ impl FilterExec {
         &self.projection
     }
 
-    /// Calculates `Statistics` for `FilterExec` by applying the filter's
-    /// selectivity (default, or estimated from interval analysis) to the input
-    /// statistics.
-    ///
-    /// The estimated output row count is used to keep the per-column statistics
-    /// consistent with it:
-    /// - null and distinct counts are capped at the estimated row count;
-    /// - byte sizes (per column and total) are scaled by the selectivity, and
-    ///   are an exact zero when the row count is an exact zero;
-    /// - a column constrained to a single value (`col = literal`, or an
-    ///   interval that collapses to one point) gets a distinct count of 1;
-    /// - a column in a null-rejecting conjunct gets a null count of 0.
-    ///
-    /// When interval analysis applies, min/max are also tightened to the
-    /// surviving value range.
-    ///
-    /// A contradictory predicate (e.g. `a = 1 AND a = 2`) yields zero rows and
-    /// empty-column statistics.
+    /// Calculates `Statistics` for `FilterExec` through a [`SynopsisContext`]:
+    /// the row count from the predicate's selectivity (the default selectivity
+    /// when the predicate has none), and each output column as the synopsis of
+    /// that column given the predicate. A column that holds each of its values
+    /// once caps the row count at the number of values the predicate asks for.
+    /// A contradictory predicate (for example `a = 1 AND a = 2`) yields zero
+    /// rows and empty-column statistics.
     pub(crate) fn statistics_helper(
         schema: &SchemaRef,
         input_stats: Statistics,
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
+        synopsis_registry: &SynopsisRegistry,
     ) -> Result<Statistics> {
-        let (eq_columns, is_infeasible) = collect_equality_columns(predicate);
-
-        let input_num_rows = input_stats.num_rows;
-        let input_total_byte_size = input_stats.total_byte_size;
-
-        // A column holding each of its values once, as a primary key or unique
-        // constraint says, matches one row per value asked for. No selectivity
-        // expresses that.
-        let match_limit = unique_match_limit(predicate, &input_stats);
-
-        let (selectivity, num_rows, column_statistics) = if is_infeasible {
-            // Contradictory predicate: no rows survive. Row-bounded counts are
-            // zero; value statistics are undefined on an empty column.
-            let mut cs = input_stats.to_inexact().column_statistics;
-            for col_stat in &mut cs {
+        let (_, is_infeasible) = collect_equality_columns(predicate);
+        if is_infeasible {
+            // No rows survive. Row-bounded counts are zero; value statistics
+            // are undefined on an empty column.
+            let mut column_statistics = input_stats.to_inexact().column_statistics;
+            for col_stat in &mut column_statistics {
                 col_stat.distinct_count = Precision::Exact(0);
                 col_stat.null_count = Precision::Exact(0);
                 col_stat.min_value = Precision::Absent;
@@ -394,66 +372,51 @@ impl FilterExec {
                 col_stat.sum_value = Precision::Absent;
                 col_stat.byte_size = Precision::Exact(0);
             }
-            (0.0, Precision::Exact(0), cs)
-        } else {
-            let null_rejecting_columns = collect_null_rejecting_columns(predicate);
+            return Ok(Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: Precision::Exact(0),
+                column_statistics,
+            });
+        }
 
-            if check_support(predicate, schema) {
-                let input_analysis_ctx = AnalysisContext::try_from_statistics(
-                    schema,
-                    &input_stats.column_statistics,
-                )?;
-                let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
-                let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
-                let filtered_num_rows =
-                    input_num_rows.with_estimated_selectivity(selectivity);
-                let cs = analysis_ctx
-                    .boundaries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, boundaries)| {
-                        column_statistics_from_boundaries(
-                            schema.field(idx).data_type(),
-                            &input_stats.column_statistics[idx],
-                            boundaries,
-                            selectivity,
-                            null_rejecting_columns.contains(&idx),
-                            filtered_num_rows,
-                        )
-                    })
-                    .collect();
-                (selectivity, filtered_num_rows, cs)
-            } else {
-                // Without interval boundaries, use the default selectivity and
-                // apply the row-count constraints that still follow from the
-                // filter predicate.
-                let selectivity = default_selectivity as f64 / 100.0;
-                let filtered_num_rows =
-                    input_num_rows.with_estimated_selectivity(selectivity);
-                let cs = input_stats
-                    .column_statistics
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col_stat)| {
-                        column_statistics_from_selectivity(
-                            col_stat,
-                            selectivity,
-                            null_rejecting_columns.contains(&idx),
-                            eq_columns.contains(&idx),
-                            filtered_num_rows,
-                        )
-                    })
-                    .collect();
-                (selectivity, filtered_num_rows, cs)
-            }
-        };
+        let default_selectivity = default_selectivity as f64 / 100.0;
+        let synopsis_ctx =
+            SynopsisContext::new_with_registry(&input_stats, schema, synopsis_registry)
+                .with_default_selectivity(default_selectivity);
+        let selectivity = synopsis_ctx
+            .compute(predicate)
+            .and_then(|synopsis| synopsis.selectivity)
+            .unwrap_or(default_selectivity);
 
-        let num_rows = match (match_limit, num_rows.get_value()) {
+        let filtered_ctx = synopsis_ctx.given(predicate, selectivity);
+        let column_statistics = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let column: Arc<dyn PhysicalExpr> =
+                    Arc::new(Column::new(field.name(), index));
+                filtered_ctx
+                    .compute(&column)
+                    .map(|synopsis| synopsis.column)
+                    .unwrap_or_else(ColumnStatistics::new_unknown)
+            })
+            .collect();
+
+        // A column holding each of its values once, as a primary key or unique
+        // constraint says, matches one row per value asked for. No selectivity
+        // expresses that.
+        let filtered_num_rows =
+            input_stats.num_rows.with_estimated_selectivity(selectivity);
+        let num_rows = match (
+            unique_match_limit(predicate, &input_stats),
+            filtered_num_rows.get_value(),
+        ) {
             (Some(limit), Some(rows)) if *rows > limit => Precision::Inexact(limit),
-            _ => num_rows,
+            _ => filtered_num_rows,
         };
         let total_byte_size =
-            scale_byte_size_at_rows(input_total_byte_size, selectivity, num_rows);
+            scale_byte_size_at_rows(input_stats.total_byte_size, selectivity, num_rows);
 
         Ok(Statistics {
             num_rows,
@@ -480,6 +443,7 @@ impl FilterExec {
             ),
             predicate,
             default_selectivity,
+            &SynopsisRegistry::new(),
         )?;
         let mut eq_properties = input.equivalence_properties().clone();
         let (equal_pairs, _) = collect_columns_from_predicate_inner(predicate);
@@ -679,14 +643,14 @@ impl ExecutionPlan for FilterExec {
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
-        let input_stats = input_stats[0].as_ref().clone();
         let stats = Self::statistics_helper(
             &self.input.schema(),
-            input_stats,
+            input_stats[0].as_ref().clone(),
             self.predicate(),
             self.default_selectivity,
+            args.synopsis_registry(),
         )?;
         Ok(Arc::new(stats.project(self.projection.as_ref())))
     }
@@ -1532,6 +1496,54 @@ mod tests {
         // `NOT IN` selects nearly everything, so the default applies.
         assert_eq!(rows(vec!["a", "b", "c"], true)?, Precision::Inexact(20));
 
+        Ok(())
+    }
+
+    // `p_size > 45 AND p_type LIKE '%BRASS%'`: interval analysis rejects the
+    // whole predicate because of `LIKE`, but supports `p_size > 45`, which
+    // keeps 5 of the 50 values of `p_size`. The `LIKE` conjunct contributes
+    // the default selectivity of 20 percent, so the estimate is about
+    // 1000 * 0.1 * 0.2 = 20 rows (21 after rounding up), instead of 200 rows
+    // for the default alone.
+    #[test]
+    fn test_filter_statistics_and_combines_supported_conjunct_with_default() -> Result<()>
+    {
+        let schema = Schema::new(vec![
+            Field::new("p_size", DataType::Int32, false),
+            Field::new("p_type", DataType::Utf8, false),
+        ]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Exact(1000),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![
+                    ColumnStatistics {
+                        distinct_count: Precision::Exact(50),
+                        min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                        max_value: Precision::Exact(ScalarValue::Int32(Some(50))),
+                        ..Default::default()
+                    },
+                    ColumnStatistics::new_unknown(),
+                ],
+            },
+            schema.clone(),
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            binary(col("p_size", &schema)?, Operator::Gt, lit(45i32), &schema)?,
+            Operator::And,
+            Arc::new(LikeExpr::new(
+                false,
+                false,
+                col("p_type", &schema)?,
+                lit("%BRASS%"),
+            )),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(statistics.num_rows, Precision::Inexact(21));
         Ok(())
     }
 
@@ -2824,9 +2836,10 @@ mod tests {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
                     )),
                 )),
-                // Input NDV is 50, but the 20% default selectivity on 100 rows
-                // estimates 20 output rows, so NDV is capped at 20.
-                vec![Precision::Inexact(20)],
+                // The 20% default selectivity on 100 rows estimates 20 output
+                // rows. The input NDV of 50 is capped at those 20 rows and then
+                // reduced to 13 for the values whose rows the filter removes.
+                vec![Precision::Inexact(13)],
             ),
             (
                 "AND with mixed types (Utf8 + Int32)",
@@ -3665,9 +3678,9 @@ mod tests {
             schema.clone(),
         ));
 
-        // Utf8 interval analysis is unsupported, so this exercises the default
-        // selectivity path. The predicate rejects nulls but does not constrain
-        // the column to one value.
+        // Interval analysis does not support Utf8, so the default selectivity
+        // applies. The predicate rejects nulls but does not constrain the
+        // column to one value.
         let predicate: Arc<dyn PhysicalExpr> =
             binary(col("name", &schema)?, Operator::Gt, lit("m"), &schema)?;
         let filter: Arc<dyn ExecutionPlan> =
@@ -3684,9 +3697,11 @@ mod tests {
             statistics.column_statistics[0].byte_size,
             Precision::Inexact(200)
         );
+        // The input NDV of 60 is capped at the 20 rows and then reduced for
+        // the values whose rows the filter removes.
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
-            Precision::Inexact(20)
+            Precision::Inexact(13)
         );
         Ok(())
     }
@@ -3717,6 +3732,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
+        // `name IS NULL` has no selectivity, so the default selectivity
+        // applies.
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(20));
@@ -3728,9 +3745,11 @@ mod tests {
             statistics.column_statistics[0].byte_size,
             Precision::Inexact(200)
         );
+        // The input NDV of 60 is capped at the 20 rows and then reduced for
+        // the values whose rows the filter removes.
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
-            Precision::Inexact(20)
+            Precision::Inexact(13)
         );
         Ok(())
     }
@@ -3770,9 +3789,11 @@ mod tests {
             statistics.column_statistics[0].byte_size,
             Precision::Inexact(200)
         );
+        // The input NDV of 60 is capped at the 20 rows and then reduced for
+        // the values whose rows the filter removes.
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
-            Precision::Inexact(20)
+            Precision::Inexact(13)
         );
         Ok(())
     }

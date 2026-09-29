@@ -1252,7 +1252,7 @@ mod tests {
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]);
-        let ctx = SynopsisContext::new(&stats, &schema);
+        let ctx = SynopsisContext::new(&stats, &schema).with_default_selectivity(0.5);
 
         let b_gt_0: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("b", 1)),
@@ -1263,6 +1263,22 @@ mod tests {
             ctx.compute(&b_gt_0).and_then(|s| s.selectivity),
             None,
             "no selectivity, not 1.0 from interval analysis"
+        );
+
+        let a_gt_40: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            lit(40_i32),
+        ));
+        let and: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a_gt_40, Operator::And, b_gt_0));
+        let selectivity = ctx
+            .compute(&and)
+            .and_then(|s| s.selectivity)
+            .expect("the conjunction has a synopsis");
+        assert!(
+            (selectivity - 0.1).abs() < 1e-9,
+            "0.2 for `a > 40` times the default 0.5, got {selectivity}"
         );
     }
 

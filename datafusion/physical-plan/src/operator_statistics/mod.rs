@@ -41,7 +41,7 @@
 //!
 //! The following providers are included and can be registered in this order:
 //!
-//! 1. [`FilterStatisticsProvider`] - selectivity-based filter estimation
+//! 1. [`FilterStatisticsProvider`] - delegates to `FilterExec`'s own estimate
 //! 2. [`ProjectionStatisticsProvider`] - column mapping through projections
 //! 3. [`PassthroughStatisticsProvider`] - passthrough for cardinality-preserving operators
 //! 4. [`AggregateStatisticsProvider`] - NDV-based GROUP BY cardinality estimation
@@ -558,15 +558,13 @@ fn computed_with_row_count(
     Ok(StatisticsResult::Computed(ExtendedStatistics::new(base)))
 }
 
-/// Statistics provider for [`FilterExec`] that uses
-/// pre-computed enhanced child statistics from the registry walk.
+/// Statistics provider for [`FilterExec`].
 ///
-/// Unlike the built-in fallback (which calls `statistics_from_inputs` and gets raw
-/// child stats), this provider receives enhanced child stats that may include
-/// NDV overrides injected at the scan level. It applies the same selectivity
-/// estimation logic as `FilterExec::statistics_helper`, then additionally
-/// adjusts each column's `distinct_count` using [`ndv_after_selectivity`] based
-/// on the computed selectivity ratio.
+/// `FilterExec::statistics_from_inputs` estimates every output column given
+/// the predicate, including the distinct-count reduction of
+/// [`ndv_after_selectivity`], and consults the expression-level providers when
+/// a `SynopsisRegistry` is in scope. Computing here would only shadow that
+/// estimate, so this provider delegates.
 #[derive(Debug, Default)]
 pub struct FilterStatisticsProvider;
 
@@ -580,42 +578,8 @@ impl StatisticsProvider for FilterStatisticsProvider {
         plan: &dyn ExecutionPlan,
         child_stats: &[ExtendedStatistics],
     ) -> Result<StatisticsResult> {
-        let Some(filter) = plan.downcast_ref::<FilterExec>() else {
-            return Ok(StatisticsResult::Delegate);
-        };
-        if child_stats.is_empty() {
-            return Ok(StatisticsResult::Delegate);
-        }
-
-        let input_stats = (*child_stats[0].base).clone();
-        let input_rows = input_stats.num_rows;
-        let mut stats = FilterExec::statistics_helper(
-            &filter.input().schema(),
-            input_stats,
-            filter.predicate(),
-            filter.default_selectivity(),
-            // TODO: pass filter.expression_analyzer_registry() once #21122 lands
-        )?;
-
-        // Adjust distinct_count for each column using the selectivity ratio
-        // via the probabilistic survival model from
-        // ndv_after_selectivity to account for rows removed by the filter.
-        if let (Some(&orig_rows), Some(&filtered_rows)) =
-            (input_rows.get_value(), stats.num_rows.get_value())
-            && orig_rows > 0
-            && filtered_rows < orig_rows
-        {
-            let selectivity = filtered_rows as f64 / orig_rows as f64;
-            for col_stat in &mut stats.column_statistics {
-                if let Some(&ndv) = col_stat.distinct_count.get_value() {
-                    let adjusted = ndv_after_selectivity(ndv, orig_rows, selectivity);
-                    col_stat.distinct_count = Precision::Inexact(adjusted);
-                }
-            }
-        }
-
-        let stats = stats.project(filter.projection().as_ref());
-        Ok(StatisticsResult::Computed(ExtendedStatistics::new(stats)))
+        let _ = (plan, child_stats);
+        Ok(StatisticsResult::Delegate)
     }
 }
 
@@ -1840,6 +1804,307 @@ mod tests {
         assert!(
             output_ndv_b < 200,
             "Expected NDV(b) < 200 after filter, got {output_ndv_b}"
+        );
+        Ok(())
+    }
+
+    /// Registering `FilterStatisticsProvider` does not change a filter's
+    /// statistics, so the distinct-count reduction of `ndv_after_selectivity`
+    /// in `FilterExec` is not applied a second time.
+    #[test]
+    fn test_filter_statistics_provider_is_a_pure_delegate() -> Result<()> {
+        use datafusion_common::ScalarValue;
+        use datafusion_physical_expr::expressions::{
+            BinaryExpr, Column as PhysColumn, Literal,
+        };
+
+        let schema = make_schema(); // "a" Int32, "b" Int32
+        let col_stats = vec![
+            {
+                let mut cs = ColumnStatistics::new_unknown();
+                cs.distinct_count = Precision::Exact(1000);
+                cs.min_value = Precision::Exact(ScalarValue::Int32(Some(1)));
+                cs.max_value = Precision::Exact(ScalarValue::Int32(Some(1000)));
+                cs
+            },
+            {
+                let mut cs = ColumnStatistics::new_unknown();
+                cs.distinct_count = Precision::Exact(800);
+                cs.min_value = Precision::Exact(ScalarValue::Int32(Some(1)));
+                cs.max_value = Precision::Exact(ScalarValue::Int32(Some(800)));
+                cs
+            },
+        ];
+        let make_filter = || -> Result<Arc<dyn ExecutionPlan>> {
+            let source: Arc<dyn ExecutionPlan> =
+                Arc::new(MockSourceExec::with_column_stats(
+                    Arc::clone(&schema),
+                    Precision::Exact(1000),
+                    col_stats.clone(),
+                ));
+            let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(PhysColumn::new("a", 0)),
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(900)))),
+            ));
+            Ok(Arc::new(FilterExec::try_new(predicate, source)?))
+        };
+
+        let with_provider =
+            StatisticsRegistry::with_providers(vec![Arc::new(FilterStatisticsProvider)]);
+        let without_provider = StatisticsRegistry::new();
+
+        let stats_with = compute(&with_provider, make_filter()?.as_ref())?;
+        let stats_without = compute(&without_provider, make_filter()?.as_ref())?;
+
+        assert_eq!(
+            stats_with.base, stats_without.base,
+            "registering FilterStatisticsProvider does not change FilterExec's statistics"
+        );
+        Ok(())
+    }
+
+    /// A predicate that interval analysis does not support (a regex match)
+    /// gets its selectivity from a `SynopsisProvider`. The statistics
+    /// registry is empty, so `FilterExec` computes the estimate itself.
+    #[test]
+    fn test_filter_selectivity_from_synopsis_registry() -> Result<()> {
+        use datafusion_physical_expr::synopsis_registry::{
+            SynopsisContext, SynopsisProvider, SynopsisRegistry, SynopsisResult,
+        };
+        use datafusion_physical_expr_common::synopsis::ExprSynopsis;
+
+        #[derive(Debug)]
+        struct RegexMatchSelectivity(f64);
+
+        impl SynopsisProvider for RegexMatchSelectivity {
+            fn compute_synopsis(
+                &self,
+                expr: &Arc<dyn PhysicalExpr>,
+                _ctx: &SynopsisContext,
+            ) -> SynopsisResult {
+                let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                    return SynopsisResult::Delegate;
+                };
+                if *binary.op() == Operator::RegexMatch {
+                    SynopsisResult::Computed(ExprSynopsis {
+                        selectivity: Some(self.0),
+                        ..ExprSynopsis::unknown(DataType::Boolean)
+                    })
+                } else {
+                    SynopsisResult::Delegate
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::new(
+            Arc::clone(&schema),
+            Precision::Exact(1000),
+        ));
+
+        // Without a provider, `s ~ '[0-9]'` gets the default selectivity.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("s", &schema)?,
+            Operator::RegexMatch,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("[0-9]".to_string())))),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, source)?);
+
+        let registry = StatisticsRegistry::new();
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(RegexMatchSelectivity(0.02))]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(filter.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        assert_eq!(
+            stats.base.num_rows,
+            Precision::Inexact(20),
+            "1000 rows * 0.02 selectivity from the provider = 20"
+        );
+        Ok(())
+    }
+
+    /// A `SynopsisProvider` that answers for a predicate that interval
+    /// analysis supports (`a = 5`) takes precedence over interval analysis
+    /// for the row count, while interval analysis still narrows the column.
+    /// The statistics registry is empty, so `FilterExec` computes the
+    /// estimate itself.
+    #[test]
+    fn test_filter_provider_selectivity_takes_precedence_over_interval_analysis()
+    -> Result<()> {
+        use datafusion_physical_expr::synopsis_registry::{
+            SynopsisContext, SynopsisProvider, SynopsisRegistry, SynopsisResult,
+        };
+        use datafusion_physical_expr_common::synopsis::ExprSynopsis;
+
+        #[derive(Debug)]
+        struct FixedSelectivity(f64);
+
+        impl SynopsisProvider for FixedSelectivity {
+            fn compute_synopsis(
+                &self,
+                expr: &Arc<dyn PhysicalExpr>,
+                _ctx: &SynopsisContext,
+            ) -> SynopsisResult {
+                let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                    return SynopsisResult::Delegate;
+                };
+                if *binary.op() == Operator::Eq {
+                    SynopsisResult::Computed(ExprSynopsis {
+                        selectivity: Some(self.0),
+                        ..ExprSynopsis::unknown(DataType::Boolean)
+                    })
+                } else {
+                    SynopsisResult::Delegate
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let column_statistics = vec![ColumnStatistics {
+            distinct_count: Precision::Exact(50),
+            min_value: Precision::Exact(ScalarValue::Int32(Some(0))),
+            max_value: Precision::Exact(ScalarValue::Int32(Some(99))),
+            ..ColumnStatistics::new_unknown()
+        }];
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::with_column_stats(
+            Arc::clone(&schema),
+            Precision::Exact(1000),
+            column_statistics,
+        ));
+
+        // `a = 5`: interval analysis supports this predicate and, from the
+        // known distinct count of 50, would estimate a selectivity of 0.02
+        // (1 / 50) on its own.
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(col("a", &schema)?, Operator::Eq, lit(5i32)));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, source)?);
+
+        let registry = StatisticsRegistry::new();
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(FixedSelectivity(0.4))]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(filter.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        assert_eq!(
+            stats.base.num_rows,
+            Precision::Inexact(400),
+            "1000 rows * 0.4 selectivity from the provider = 400, not the 20 rows \
+             (1000 * 1/50) interval analysis would give on its own"
+        );
+        assert_eq!(
+            stats.base.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int32(Some(5))),
+            "interval analysis still narrows the column, even though the \
+             provider's selectivity decides the row count"
+        );
+        assert_eq!(
+            stats.base.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int32(Some(5))),
+            "interval analysis still narrows the column, even though the \
+             provider's selectivity decides the row count"
+        );
+        Ok(())
+    }
+
+    /// A `SynopsisProvider` answers the synopsis of column `b` under a
+    /// condition, as an application that knows that 800 distinct `b` values
+    /// satisfy `a = 5` would. `FilterExec` computes each output column given
+    /// its predicate, so the provider's answer becomes `b`'s output
+    /// statistics, while `a` keeps the built-in narrowing to the single value
+    /// 5. The provider declines when there is no condition, so it does not
+    /// change the input's own statistics.
+    #[test]
+    fn test_filter_provider_answers_column_under_condition() -> Result<()> {
+        use datafusion_physical_expr::synopsis_registry::{
+            SynopsisContext, SynopsisProvider, SynopsisRegistry, SynopsisResult,
+        };
+        use datafusion_physical_expr_common::synopsis::ExprSynopsis;
+
+        #[derive(Debug)]
+        struct ConditionedDistinctCount;
+
+        impl SynopsisProvider for ConditionedDistinctCount {
+            fn compute_synopsis(
+                &self,
+                expr: &Arc<dyn PhysicalExpr>,
+                ctx: &SynopsisContext,
+            ) -> SynopsisResult {
+                if ctx.args().condition().is_none() {
+                    return SynopsisResult::Delegate;
+                }
+                let Some(column) = expr.downcast_ref::<Column>() else {
+                    return SynopsisResult::Delegate;
+                };
+                if column.name() == "b" {
+                    SynopsisResult::Computed(ExprSynopsis::from_column(
+                        ColumnStatistics {
+                            distinct_count: Precision::Inexact(800),
+                            ..ColumnStatistics::new_unknown()
+                        },
+                        DataType::Int32,
+                    ))
+                } else {
+                    SynopsisResult::Delegate
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let column_statistics = vec![
+            ColumnStatistics {
+                distinct_count: Precision::Exact(2),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(0))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(9))),
+                ..ColumnStatistics::new_unknown()
+            },
+            ColumnStatistics {
+                distinct_count: Precision::Exact(5000),
+                ..ColumnStatistics::new_unknown()
+            },
+        ];
+        let source: Arc<dyn ExecutionPlan> = Arc::new(MockSourceExec::with_column_stats(
+            Arc::clone(&schema),
+            Precision::Exact(10000),
+            column_statistics,
+        ));
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(col("a", &schema)?, Operator::Eq, lit(5i32)));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, source)?);
+
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(ConditionedDistinctCount)]);
+        let stats = StatisticsContext::new_with_registry(StatisticsRegistry::new())
+            .with_synopsis_registry(synopsis_registry)
+            .compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(
+            stats.column_statistics[1].distinct_count,
+            Precision::Inexact(800),
+            "the provider's conditioned synopsis is `b`'s output statistics"
+        );
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int32(Some(5))),
+            "`a` keeps the built-in narrowing by interval analysis"
+        );
+        assert_eq!(
+            stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int32(Some(5))),
+            "`a` keeps the built-in narrowing by interval analysis"
         );
         Ok(())
     }

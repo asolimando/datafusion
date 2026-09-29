@@ -23,7 +23,7 @@
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --example statistics -- [all|join_reorder|aggregate_synopsis_ndv]
+//! cargo run --example statistics -- [all|join_reorder|tenant_skew|aggregate_synopsis_ndv]
 //! ```
 //!
 //! Each subcommand runs a corresponding example:
@@ -32,11 +32,15 @@
 //! - `join_reorder`
 //!   (file: join_reorder.rs, desc: Supply and refine column statistics via a provider to flip a join order)
 //!
+//! - `tenant_skew`
+//!   (file: tenant_skew.rs, desc: Plug a per-tenant row count into filter selectivity via the SynopsisRegistry)
+//!
 //! - `aggregate_synopsis_ndv`
 //!   (file: aggregate_synopsis_ndv.rs, desc: Estimate GROUP BY date_trunc(...) cardinality from an expression-level provider, in one-stage and two-phase plans)
 
 mod aggregate_synopsis_ndv;
 mod join_reorder;
+mod tenant_skew;
 
 use datafusion::error::{DataFusionError, Result};
 use strum::{IntoEnumIterator, VariantNames};
@@ -47,6 +51,7 @@ use strum_macros::{Display, EnumIter, EnumString, VariantNames};
 enum ExampleKind {
     All,
     JoinReorder,
+    TenantSkew,
     AggregateSynopsisNdv,
 }
 
@@ -67,6 +72,7 @@ impl ExampleKind {
                 Ok(())
             }
             ExampleKind::JoinReorder => join_reorder::join_reorder().await,
+            ExampleKind::TenantSkew => tenant_skew::tenant_skew().await,
             ExampleKind::AggregateSynopsisNdv => {
                 aggregate_synopsis_ndv::aggregate_synopsis_ndv().await
             }
