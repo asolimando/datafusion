@@ -2137,6 +2137,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "dashmap",
  "datafusion",
  "datafusion-proto",

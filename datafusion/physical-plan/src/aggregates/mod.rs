@@ -1638,14 +1638,15 @@ impl AggregateExec {
             // self.schema: [<group by exprs>, <aggregate exprs>]
             let mut column_statistics = Statistics::unknown_column(&self.schema());
 
+            // In a two-phase plan, the union of the partial outputs holds exactly
+            // the global distinct group values, so a partial aggregate's group
+            // column can carry the global distinct count for the final stage.
             for (idx, (expr, _)) in self.group_by().expr.iter().enumerate() {
-                if let Some(col) = expr.downcast_ref::<Column>() {
-                    let child_col_stats =
-                        &child_statistics.column_statistics[col.index()];
-                    column_statistics[idx].max_value = child_col_stats.max_value.clone();
-                    column_statistics[idx].min_value = child_col_stats.min_value.clone();
+                if let Some(synopsis) = synopsis_ctx.compute(expr) {
+                    column_statistics[idx].max_value = synopsis.column.max_value;
+                    column_statistics[idx].min_value = synopsis.column.min_value;
                     column_statistics[idx].distinct_count =
-                        child_col_stats.distinct_count;
+                        synopsis.column.distinct_count;
                 }
             }
 

@@ -220,9 +220,10 @@ cargo run --example dataframe -- dataframe
 
 #### Category: Single Process
 
-| Subcommand   | File Path                                                           | Description                                                             |
-| ------------ | ------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| join_reorder | [`statistics/join_reorder.rs`](examples/statistics/join_reorder.rs) | Supply and refine column statistics via a provider to flip a join order |
+| Subcommand             | File Path                                                                               | Description                                                                                                       |
+| ---------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| join_reorder           | [`statistics/join_reorder.rs`](examples/statistics/join_reorder.rs)                     | Supply and refine column statistics via a provider to flip a join order                                           |
+| aggregate_synopsis_ndv | [`statistics/aggregate_synopsis_ndv.rs`](examples/statistics/aggregate_synopsis_ndv.rs) | Estimate GROUP BY date_trunc(...) cardinality from an expression-level provider, in one-stage and two-phase plans |
 
 ## UDF Examples
 

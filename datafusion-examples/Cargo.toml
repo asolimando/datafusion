@@ -38,6 +38,7 @@ workspace = true
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+chrono = { workspace = true }
 # note: only use the main datafusion crate for examples
 datafusion = { workspace = true, default-features = true, features = ["parquet_encryption"] }
 nom = "8.0.0"

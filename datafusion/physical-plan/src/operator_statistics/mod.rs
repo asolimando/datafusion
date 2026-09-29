@@ -2318,6 +2318,108 @@ mod tests {
         Ok(())
     }
 
+    /// A bare group column keeps the input's `Exact` distinct count, also in a
+    /// `Partial` aggregate.
+    #[test]
+    fn test_aggregate_group_column_keeps_exact_distinct_count() -> Result<()> {
+        let source = make_source_with_ndv(200, vec![Some(10)]);
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("c0", 0)) as Arc<dyn PhysicalExpr>,
+            "c0".to_string(),
+        )]);
+        let agg: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by,
+            vec![],
+            vec![],
+            Arc::clone(&source),
+            source.schema(),
+        )?);
+
+        let stats =
+            StatisticsContext::new().compute(agg.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(
+            stats.column_statistics[0].distinct_count,
+            Precision::Exact(10)
+        );
+        Ok(())
+    }
+
+    /// A `Partial` aggregate publishes the distinct count of a non-column
+    /// group expression as its output column's `distinct_count`, while its
+    /// row count stays capped at the input row count. The distinct count is
+    /// chosen above the input row count, so the two values differ.
+    #[test]
+    fn test_aggregate_partial_publishes_group_ndv_independently_of_num_rows() -> Result<()>
+    {
+        #[derive(Debug)]
+        struct LargeNdvSynopsis(usize);
+
+        impl SynopsisProvider for LargeNdvSynopsis {
+            fn compute_synopsis(
+                &self,
+                expr: &Arc<dyn PhysicalExpr>,
+                _ctx: &SynopsisContext,
+            ) -> SynopsisResult {
+                let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                    return SynopsisResult::Delegate;
+                };
+                if *binary.op() == Operator::Plus {
+                    let column = ColumnStatistics {
+                        distinct_count: Precision::Exact(self.0),
+                        ..ColumnStatistics::new_unknown()
+                    };
+                    SynopsisResult::Computed(ExprSynopsis::from_column(
+                        column,
+                        DataType::Int32,
+                    ))
+                } else {
+                    SynopsisResult::Delegate
+                }
+            }
+        }
+
+        let input_rows = 50;
+        let large_ndv = 1000;
+        let source = make_source_with_ndv(input_rows, vec![None, None]);
+        let group_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c0", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("c1", 1)),
+        ));
+        let group_by = PhysicalGroupBy::new_single(vec![(group_expr, "sum".to_string())]);
+        let agg: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by,
+            vec![],
+            vec![],
+            Arc::clone(&source),
+            source.schema(),
+        )?);
+
+        let registry = StatisticsRegistry::new();
+        let synopsis_registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(LargeNdvSynopsis(large_ndv))]);
+
+        let stats = (*StatisticsContext::new_with_registry(registry)
+            .with_synopsis_registry(synopsis_registry)
+            .compute_extended(agg.as_ref(), &StatisticsArgs::new())?)
+        .clone();
+
+        assert_eq!(
+            stats.base.num_rows,
+            Precision::Inexact(input_rows),
+            "the row count stays at the input row count, min(input_rows, ndv)"
+        );
+        assert_eq!(
+            stats.base.column_statistics[0].distinct_count,
+            Precision::Exact(large_ndv),
+            "the group column carries the full distinct count from the provider"
+        );
+        Ok(())
+    }
+
     /// With both a `StatisticsProvider` and a `SynopsisProvider` registered,
     /// the `StatisticsProvider`'s row count is the result.
     #[test]
