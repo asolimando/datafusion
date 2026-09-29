@@ -41,6 +41,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Schema};
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, Statistics};
+use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
@@ -321,7 +322,8 @@ impl<'a> SynopsisContext<'a> {
     /// expression whose whole subtree interval analysis supports, with no
     /// provider answer inside, takes its selectivity from one `analyze()`
     /// call. Otherwise the expression's own rule combines its children's
-    /// synopses.
+    /// synopses. A missing range comes from `evaluate_bounds` on the
+    /// children's ranges, for a provider's answer too.
     pub fn compute(&self, expr: &Arc<dyn PhysicalExpr>) -> Option<ExprSynopsis> {
         // The borrow ends here, before any recursive call.
         if let Some(cached) = self.cache.borrow().get(expr) {
@@ -337,7 +339,9 @@ impl<'a> SynopsisContext<'a> {
             return None;
         };
 
-        let mut result = self.provider_answer(expr, &data_type);
+        let mut result = self
+            .provider_answer(expr, &data_type)
+            .map(|synopsis| self.fill_missing_range(expr, &data_type, synopsis));
         if result.is_none() {
             result = self.compute_supported_subtree(expr, &data_type);
         }
@@ -438,11 +442,9 @@ impl<'a> SynopsisContext<'a> {
         Some(synopsis)
     }
 
-    /// Computes `expr` by computing its children through the full chain and
-    /// applying `expr`'s own rule to their synopses. This is the fallback
-    /// when [`Self::compute_supported_subtree`] does not apply: `expr` is not
-    /// Boolean, `check_support` rejects it, or a provider answers an
-    /// expression inside its subtree.
+    /// Computes `expr` by computing its children through the full chain,
+    /// applying `expr`'s own rule to their synopses, and filling a missing
+    /// range from their ranges.
     fn compute_from_children(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
@@ -474,6 +476,18 @@ impl<'a> SynopsisContext<'a> {
 
         if let Some(column) = self.conditioned_column(expr, data_type) {
             synopsis = Some(column);
+        }
+
+        // Leaves (no children) keep their own min/max, set by the `Column` and
+        // `Literal` rules.
+        if !children.is_empty() {
+            synopsis = self.merge_evaluated_range(
+                expr,
+                &children,
+                &child_synopses,
+                data_type,
+                synopsis,
+            );
         }
         synopsis
     }
@@ -526,6 +540,111 @@ impl<'a> SynopsisContext<'a> {
         let statistics = estimate.column_statistics(column.index(), &self.args)?;
         Some(ExprSynopsis::from_column(statistics, data_type.clone()))
     }
+
+    /// Fills a missing range of a provider's answer for a non-leaf `expr`,
+    /// computing its children only when needed.
+    fn fill_missing_range(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        data_type: &DataType,
+        synopsis: ExprSynopsis,
+    ) -> ExprSynopsis {
+        let children = expr.children();
+        let has_range = synopsis.column.min_value != Precision::Absent
+            && synopsis.column.max_value != Precision::Absent;
+        if children.is_empty() || has_range {
+            return synopsis;
+        }
+        let child_synopses: Vec<Option<ExprSynopsis>> =
+            children.iter().map(|child| self.compute(child)).collect();
+        self.merge_evaluated_range(
+            expr,
+            &children,
+            &child_synopses,
+            data_type,
+            Some(synopsis.clone()),
+        )
+        .unwrap_or(synopsis)
+    }
+
+    /// Computes `expr`'s range from its children's ranges with
+    /// [`PhysicalExpr::evaluate_bounds`] and fills the missing min/max of
+    /// `synopsis`, creating one that carries only the range when `synopsis` is
+    /// `None`.
+    fn merge_evaluated_range(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        children: &[&Arc<dyn PhysicalExpr>],
+        child_synopses: &[Option<ExprSynopsis>],
+        data_type: &DataType,
+        synopsis: Option<ExprSynopsis>,
+    ) -> Option<ExprSynopsis> {
+        let intervals: Option<Vec<Interval>> = children
+            .iter()
+            .copied()
+            .zip(child_synopses)
+            .map(|(child, child_synopsis)| {
+                child_interval(child, child_synopsis.as_ref(), self.args.input_schema())
+            })
+            .collect();
+        let Some(intervals) = intervals else {
+            return synopsis;
+        };
+        let interval_refs: Vec<&Interval> = intervals.iter().collect();
+        let Ok(range) = expr.evaluate_bounds(&interval_refs) else {
+            return synopsis;
+        };
+        Some(apply_range(synopsis, &range, data_type))
+    }
+}
+
+/// Builds the `Interval` a child contributes to `evaluate_bounds`: its own
+/// bounds when both are known, otherwise an unbounded interval of its type.
+/// A child with no synopsis at all also gets an unbounded interval, of the
+/// child expression's own type.
+fn child_interval(
+    child: &Arc<dyn PhysicalExpr>,
+    synopsis: Option<&ExprSynopsis>,
+    input_schema: &Schema,
+) -> Option<Interval> {
+    match synopsis {
+        Some(synopsis) => {
+            match (
+                synopsis.column.min_value.get_value(),
+                synopsis.column.max_value.get_value(),
+            ) {
+                (Some(min), Some(max)) => {
+                    Interval::try_new(min.clone(), max.clone()).ok()
+                }
+                _ => Interval::make_unbounded(&synopsis.data_type).ok(),
+            }
+        }
+        None => {
+            let data_type = child.data_type(input_schema).ok()?;
+            Interval::make_unbounded(&data_type).ok()
+        }
+    }
+}
+
+/// Fills a missing min/max from `range`'s finite endpoints, as `Inexact`: an
+/// envelope need not be reached, for example the minimum of `a + b` can be
+/// above `min(a) + min(b)`. A min or max already set is kept.
+fn apply_range(
+    synopsis: Option<ExprSynopsis>,
+    range: &Interval,
+    data_type: &DataType,
+) -> ExprSynopsis {
+    let mut synopsis =
+        synopsis.unwrap_or_else(|| ExprSynopsis::unknown(data_type.clone()));
+    let lower = range.lower();
+    let upper = range.upper();
+    if !lower.is_null() && synopsis.column.min_value == Precision::Absent {
+        synopsis.column.min_value = Precision::Inexact(lower.clone());
+    }
+    if !upper.is_null() && synopsis.column.max_value == Precision::Absent {
+        synopsis.column.max_value = Precision::Inexact(upper.clone());
+    }
+    synopsis
 }
 
 /// Sets the synopsis type from the schema, whatever the provider or rule
@@ -540,7 +659,7 @@ fn conform(mut synopsis: ExprSynopsis, data_type: &DataType) -> Option<ExprSynop
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{BinaryExpr, Column, LikeExpr, lit};
+    use crate::expressions::{BinaryExpr, Column, LikeExpr, NotExpr, lit};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, ScalarValue};
@@ -848,16 +967,12 @@ mod tests {
         );
     }
 
+    // A provider's answer replaces the built-in rule's.
     #[test]
-    fn provider_answer_replaces_builtin_and_skips_children() {
+    fn provider_answer_replaces_builtin() {
         let (stats, schema) = one_col_stats(42, DataType::Float64);
-        let counter = Arc::new(AtomicUsize::new(0));
-        // `OverrideBinary` is first, so it is asked first; `CountComputations`
-        // is asked only for an expression that `OverrideBinary` declines.
-        let registry = SynopsisRegistry::with_providers(vec![
-            Arc::new(OverrideBinary { ndv: 999 }),
-            Arc::new(CountComputations(Arc::clone(&counter))),
-        ]);
+        let registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(OverrideBinary { ndv: 999 })]);
         let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
 
         let a_plus_1: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
@@ -865,16 +980,7 @@ mod tests {
             Operator::Plus,
             lit(1.0_f64),
         ));
-        assert_eq!(
-            ctx.compute(&a_plus_1).and_then(|s| s.ndv()),
-            Some(999),
-            "the provider's value is the result"
-        );
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            0,
-            "the built-in path never ran, so neither operand was computed"
-        );
+        assert_eq!(ctx.compute(&a_plus_1).and_then(|s| s.ndv()), Some(999));
     }
 
     /// Knows the selectivity of a named Boolean column, for example the
@@ -1312,5 +1418,129 @@ mod tests {
             None,
             "no selectivity from interval analysis, which failed"
         );
+    }
+
+    // Neither operand of `a + b` is a constant, so no built-in NDV rule
+    // covers it and the distinct count is absent. `evaluate_bounds` still
+    // supplies a range: the minimum is the sum of the operands' minimums
+    // and the maximum is the sum of the operands' maximums, both `Inexact`.
+    #[test]
+    fn range_from_evaluate_bounds_when_no_ndv_rule_applies() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![cs(50, 0.0, 99.0), cs(50, 200.0, 300.0)],
+        };
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(a, Operator::Plus, b));
+
+        let synopsis = ctx
+            .compute(&sum)
+            .expect("evaluate_bounds supplies a range even with no NDV rule");
+        assert_eq!(
+            synopsis.column.min_value,
+            Precision::Inexact(ScalarValue::Float64(Some(200.0))),
+            "the minimum is the sum of the operands' minimums"
+        );
+        assert_eq!(
+            synopsis.column.max_value,
+            Precision::Inexact(ScalarValue::Float64(Some(399.0))),
+            "the maximum is the sum of the operands' maximums"
+        );
+        assert_eq!(
+            synopsis.column.distinct_count,
+            Precision::Absent,
+            "no built-in rule covers two non-constant operands"
+        );
+    }
+
+    /// Supplies a distinct count and a minimum for any binary expression,
+    /// but no maximum.
+    #[derive(Debug)]
+    struct NdvAndMinimum;
+
+    impl SynopsisProvider for NdvAndMinimum {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(_) = expr.downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            SynopsisResult::Computed(ExprSynopsis::from_column(
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(5),
+                    min_value: Precision::Exact(ScalarValue::Float64(Some(250.0))),
+                    ..ColumnStatistics::new_unknown()
+                },
+                DataType::Float64,
+            ))
+        }
+    }
+
+    // A provider's answer keeps the minimum it sets, and gets the maximum it
+    // leaves out from `evaluate_bounds`, as a built-in rule's answer would.
+    #[test]
+    fn provider_synopsis_gets_a_missing_range_and_keeps_its_own() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![cs(10, 0.0, 99.0), cs(10, 200.0, 300.0)],
+        };
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]);
+        let registry = SynopsisRegistry::with_providers(vec![Arc::new(NdvAndMinimum)]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(a, Operator::Plus, b));
+
+        let synopsis = ctx.compute(&sum).expect("the provider supplies a synopsis");
+        assert_eq!(synopsis.ndv(), Some(5));
+        assert_eq!(
+            synopsis.column.min_value,
+            Precision::Exact(ScalarValue::Float64(Some(250.0))),
+            "the provider's minimum is kept"
+        );
+        assert_eq!(
+            synopsis.column.max_value,
+            Precision::Inexact(ScalarValue::Float64(Some(399.0))),
+            "the missing maximum comes from evaluate_bounds"
+        );
+    }
+
+    // A Boolean expression gets its range from `evaluate_bounds` too: `NOT b`,
+    // with `b` always false, is always true.
+    #[test]
+    fn boolean_expression_gets_a_range() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                min_value: Precision::Exact(ScalarValue::Boolean(Some(false))),
+                max_value: Precision::Exact(ScalarValue::Boolean(Some(false))),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let schema = Schema::new(vec![Field::new("b", DataType::Boolean, false)]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let not_b: Arc<dyn PhysicalExpr> =
+            Arc::new(NotExpr::new(Arc::new(Column::new("b", 0))));
+        let synopsis = ctx.compute(&not_b).expect("NOT b has a synopsis");
+        let always_true = Precision::Inexact(ScalarValue::Boolean(Some(true)));
+        assert_eq!(synopsis.column.min_value, always_true);
+        assert_eq!(synopsis.column.max_value, always_true);
     }
 }
