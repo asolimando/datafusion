@@ -1396,7 +1396,8 @@ mod tests {
     }
 
     // A non-NULL row passes exactly one of `=` and `!=`, And keeps no more
-    // rows than either side, and every selectivity is in [0, 1]. And is
+    // rows than either side, Or keeps at least as many as either side and no
+    // more than both together, and every selectivity is in [0, 1]. And is
     // unknown when neither side has a selectivity (here, a column that is not
     // a predicate and `Modulo`, which has no rule), so the caller's default
     // applies.
@@ -1432,6 +1433,14 @@ mod tests {
         assert!(
             selectivity(&and) <= eq_sel.min(not_eq_sel),
             "And keeps no more rows than either side"
+        );
+
+        let or: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(eq, Operator::Or, not_eq));
+        let or_sel = selectivity(&or);
+        assert!(
+            eq_sel.max(not_eq_sel) <= or_sel && or_sel <= eq_sel + not_eq_sel,
+            "Or keeps at least as many rows as either side and no more than both"
         );
 
         let no_rule: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(

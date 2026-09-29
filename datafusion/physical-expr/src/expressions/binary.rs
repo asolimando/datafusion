@@ -710,6 +710,18 @@ impl PhysicalExpr for BinaryExpr {
                     ..ExprSynopsis::unknown(output_type)
                 })
             }
+            // Disjunction selectivity under the same independence assumption:
+            // `l + r - l * r`, the union of the two fractions without counting
+            // their overlap twice.
+            Operator::Or => {
+                let l = left.selectivity?;
+                let r = right.selectivity?;
+                let output_type = self.data_type(input_schema).ok()?;
+                Some(ExprSynopsis {
+                    selectivity: Some(l + r - l * r),
+                    ..ExprSynopsis::unknown(output_type)
+                })
+            }
             _ => None,
         }
     }

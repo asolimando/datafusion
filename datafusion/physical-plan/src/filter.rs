@@ -2840,10 +2840,12 @@ mod tests {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
                     )),
                 )),
-                // The 20% default selectivity on 100 rows estimates 20 output
-                // rows. The input NDV of 50 is capped at those 20 rows and then
-                // reduced to 13 for the values whose rows the filter removes.
-                vec![Precision::Inexact(13)],
+                // The built-in `Eq` rule gives each side 1 / 50, and the `Or`
+                // rule gives 0.02 + 0.02 - 0.02 * 0.02 = 0.0396, so 4 of the
+                // 100 rows. The input NDV of 50 is capped at those 4 rows and
+                // then reduced to 3 for the values whose rows the filter
+                // removes.
+                vec![Precision::Inexact(3)],
             ),
             (
                 "AND with mixed types (Utf8 + Int32)",
@@ -3736,8 +3738,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        // `name IS NULL` has no selectivity, so the default selectivity
-        // applies.
+        // `name IS NULL` has no selectivity, so the `Or` rule gives none and
+        // the default selectivity applies.
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(20));
