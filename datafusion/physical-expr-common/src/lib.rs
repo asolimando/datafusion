@@ -37,5 +37,6 @@ pub mod metrics;
 pub mod physical_expr;
 pub mod regex;
 pub mod sort_expr;
+pub mod synopsis;
 pub mod tree_node;
 pub mod utils;

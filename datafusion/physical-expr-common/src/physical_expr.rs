@@ -21,6 +21,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::synopsis::{ExprSynopsis, SynopsisArgs};
 use crate::utils::scatter;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, new_empty_array};
@@ -93,6 +94,21 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
             self.data_type(input_schema)?,
             self.nullable(input_schema)?,
         )))
+    }
+    /// Estimates statistics of this expression's output from `args` and the
+    /// synopses already computed for its children, in the order of
+    /// [`Self::children`].
+    ///
+    /// An implementation holds only the expression's own rule. The caller
+    /// walks the expression tree, caches the results and consults custom
+    /// providers. The default returns `None`, which means that the
+    /// expression has no rule.
+    fn synopsis_from_inputs(
+        &self,
+        _args: &SynopsisArgs,
+        _child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        None
     }
     /// Evaluates this expression only for rows where `selection` is `true`.
     ///
