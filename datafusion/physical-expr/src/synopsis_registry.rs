@@ -43,6 +43,9 @@ use datafusion_common::Statistics;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
+use crate::intervals::utils::check_support;
+use crate::{AnalysisContext, analyze};
+
 /// Result of attempting to compute a synopsis with a [`SynopsisProvider`],
 /// the expression-level counterpart of `StatisticsResult`.
 #[derive(Debug)]
@@ -121,6 +124,15 @@ static EMPTY: SynopsisRegistry = SynopsisRegistry {
 /// nothing computed it.
 type CacheEntry = Option<ExprSynopsis>;
 
+/// The `analyze()` outcome for one expression.
+#[derive(Debug)]
+struct AnalyzeResult {
+    selectivity: Option<f64>,
+}
+
+/// The `analyze()` outcome per expression, `None` when there is none.
+type AnalysisCache = HashMap<Arc<dyn PhysicalExpr>, Option<Arc<AnalyzeResult>>>;
+
 /// Walks an expression tree and caches the synopsis of each expression, the
 /// expression-level counterpart of `StatisticsContext`.
 ///
@@ -133,6 +145,12 @@ pub struct SynopsisContext<'a> {
     args: SynopsisArgs<'a>,
     registry: &'a SynopsisRegistry,
     cache: RefCell<HashMap<Arc<dyn PhysicalExpr>, CacheEntry>>,
+    /// The providers' answer per expression, `None` when none answers.
+    provider_cache: RefCell<HashMap<Arc<dyn PhysicalExpr>, Option<ExprSynopsis>>>,
+    /// Per-expression cache of whether an expression's subtree (itself and
+    /// every descendant) contains no provider answer.
+    provider_free_cache: RefCell<HashMap<Arc<dyn PhysicalExpr>, bool>>,
+    analysis_cache: RefCell<AnalysisCache>,
 }
 
 impl<'a> SynopsisContext<'a> {
@@ -153,6 +171,9 @@ impl<'a> SynopsisContext<'a> {
             args: SynopsisArgs::new(input_stats, input_schema),
             registry,
             cache: RefCell::new(HashMap::new()),
+            provider_cache: RefCell::new(HashMap::new()),
+            provider_free_cache: RefCell::new(HashMap::new()),
+            analysis_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -165,10 +186,11 @@ impl<'a> SynopsisContext<'a> {
     /// Computes the synopsis of `expr`, caching it by structural expression
     /// identity.
     ///
-    /// The registered providers are asked first, and the first answer is the
-    /// result. Otherwise the built-in estimate applies: the expression's own
-    /// rule on the synopses of its children, which are computed in the same
-    /// way.
+    /// The registered providers are asked first. Otherwise a Boolean
+    /// expression whose whole subtree interval analysis supports, with no
+    /// provider answer inside, takes its selectivity from one `analyze()`
+    /// call. Otherwise the expression's own rule combines its children's
+    /// synopses.
     pub fn compute(&self, expr: &Arc<dyn PhysicalExpr>) -> Option<ExprSynopsis> {
         // The borrow ends here, before any recursive call.
         if let Some(cached) = self.cache.borrow().get(expr) {
@@ -186,6 +208,9 @@ impl<'a> SynopsisContext<'a> {
 
         let mut result = self.provider_answer(expr, &data_type);
         if result.is_none() {
+            result = self.compute_supported_subtree(expr, &data_type);
+        }
+        if result.is_none() {
             result = self.compute_from_children(expr, &data_type);
         }
 
@@ -195,12 +220,22 @@ impl<'a> SynopsisContext<'a> {
         result
     }
 
+    /// The answer is cached per expression, so a provider is asked at most
+    /// once for the same expression in this context, whether the caller is
+    /// [`Self::compute`] or [`Self::subtree_free_of_providers`].
     fn provider_answer(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         data_type: &DataType,
     ) -> Option<ExprSynopsis> {
-        self.registry.providers.iter().find_map(|p| {
+        if let Some(cached) = self.provider_cache.borrow().get(expr) {
+            return cached.clone();
+        }
+        // Guard against a provider that asks for its own expression's answer.
+        self.provider_cache
+            .borrow_mut()
+            .insert(Arc::clone(expr), None);
+        let result = self.registry.providers.iter().find_map(|p| {
             match p.compute_synopsis(expr, self) {
                 SynopsisResult::Computed(synopsis) => {
                     let conformed = conform(synopsis, data_type);
@@ -213,11 +248,67 @@ impl<'a> SynopsisContext<'a> {
                 }
                 SynopsisResult::Delegate => None,
             }
-        })
+        });
+        self.provider_cache
+            .borrow_mut()
+            .insert(Arc::clone(expr), result.clone());
+        result
+    }
+
+    /// Whether `expr`'s subtree, `expr` itself and every descendant, contains
+    /// no provider answer.
+    fn subtree_free_of_providers(&self, expr: &Arc<dyn PhysicalExpr>) -> bool {
+        if let Some(cached) = self.provider_free_cache.borrow().get(expr) {
+            return *cached;
+        }
+        let free = match expr.data_type(self.args.input_schema()) {
+            Ok(data_type) => {
+                self.provider_answer(expr, &data_type).is_none()
+                    && expr
+                        .children()
+                        .iter()
+                        .all(|child| self.subtree_free_of_providers(child))
+            }
+            Err(_) => false,
+        };
+        self.provider_free_cache
+            .borrow_mut()
+            .insert(Arc::clone(expr), free);
+        free
+    }
+
+    /// Computes `expr`'s selectivity from one `analyze()` call on its own
+    /// subtree. Returns `None` when `expr` is not Boolean, when a provider
+    /// answers inside its subtree, or when `analyze()` gives no selectivity.
+    /// A non-leaf `expr` does not compute its children, since `analyze()`
+    /// already covers the whole subtree.
+    fn compute_supported_subtree(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        data_type: &DataType,
+    ) -> Option<ExprSynopsis> {
+        if *data_type != DataType::Boolean || !self.subtree_free_of_providers(expr) {
+            return None;
+        }
+        let analysis = self.analyze_once(expr)?;
+        let selectivity = analysis.selectivity?;
+        let children = expr.children();
+        let mut synopsis = if children.is_empty() {
+            expr.synopsis_from_inputs(&self.args, &[])
+                .and_then(|s| conform(s, data_type))
+                .unwrap_or_else(|| ExprSynopsis::unknown(data_type.clone()))
+        } else {
+            ExprSynopsis::unknown(data_type.clone())
+        };
+        synopsis.selectivity = Some(selectivity);
+        Some(synopsis)
     }
 
     /// Computes `expr` by computing its children through the full chain and
-    /// applying `expr`'s own rule to their synopses.
+    /// applying `expr`'s own rule to their synopses. This is the fallback
+    /// when [`Self::compute_supported_subtree`] does not apply: `expr` is not
+    /// Boolean, `check_support` rejects it, or a provider answers an
+    /// expression inside its subtree.
     fn compute_from_children(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
@@ -246,6 +337,40 @@ impl<'a> SynopsisContext<'a> {
             expr.synopsis_from_inputs(&self.args, &computed)
                 .and_then(|s| conform(s, data_type))
         })
+    }
+
+    /// Runs `analyze()` on `expr`'s own subtree and caches the outcome, so
+    /// the same expression is analyzed at most once in this context. Returns
+    /// `None` when `check_support` rejects `expr` or `analyze()` fails.
+    fn analyze_once(&self, expr: &Arc<dyn PhysicalExpr>) -> Option<Arc<AnalyzeResult>> {
+        if let Some(cached) = self.analysis_cache.borrow().get(expr) {
+            return cached.clone();
+        }
+        let schema = self.args.input_schema();
+        let result = if check_support(expr, &Arc::new(schema.clone())) {
+            AnalysisContext::try_from_statistics(
+                schema,
+                &self.args.input_stats().column_statistics,
+            )
+            .and_then(|input| analyze(expr, input, schema))
+            .inspect_err(|e| {
+                log::debug!(
+                    "interval analysis failed for `{expr}`, estimating without it: {e}"
+                )
+            })
+            .ok()
+            .map(|analysis| {
+                Arc::new(AnalyzeResult {
+                    selectivity: analysis.selectivity,
+                })
+            })
+        } else {
+            None
+        };
+        self.analysis_cache
+            .borrow_mut()
+            .insert(Arc::clone(expr), result.clone());
+        result
     }
 }
 
@@ -693,6 +818,118 @@ mod tests {
         assert!(
             (sel - 0.1).abs() < 1e-9,
             "AND selectivity = 0.2 * 0.5 = {sel}"
+        );
+    }
+
+    /// `p_size` (Int32, 1 to 50, 50 distinct values) and `p_type` (Utf8,
+    /// no statistics), over 1000 rows.
+    fn part_stats() -> (Statistics, Schema) {
+        let stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(50),
+                    min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                    max_value: Precision::Exact(ScalarValue::Int32(Some(50))),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let schema = Schema::new(vec![
+            Field::new("p_size", DataType::Int32, false),
+            Field::new("p_type", DataType::Utf8, false),
+        ]);
+        (stats, schema)
+    }
+
+    // Interval analysis supplies the selectivity of a Boolean expression it
+    // supports.
+    #[test]
+    fn interval_analysis_is_the_builtin_selectivity_of_a_supported_predicate() {
+        let (stats, schema) = part_stats();
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let p_size_gt_40: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p_size", 0)),
+            Operator::Gt,
+            lit(40_i32),
+        ));
+        let selectivity = ctx
+            .compute(&p_size_gt_40)
+            .and_then(|s| s.selectivity)
+            .expect("the predicate has a synopsis");
+        let input =
+            AnalysisContext::try_from_statistics(&schema, &stats.column_statistics)
+                .unwrap();
+        let analysis = analyze(&p_size_gt_40, input, &schema).unwrap();
+        assert_eq!(Some(selectivity), analysis.selectivity);
+    }
+
+    // A column with no min or max gives interval analysis nothing to narrow,
+    // so interval analysis does not answer for a comparison on it.
+    #[test]
+    fn interval_analysis_does_not_answer_without_bounds() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                    max_value: Precision::Exact(ScalarValue::Int32(Some(50))),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let b_gt_0: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 1)),
+            Operator::Gt,
+            lit(0_i32),
+        ));
+        assert_eq!(
+            ctx.compute(&b_gt_0).and_then(|s| s.selectivity),
+            None,
+            "no selectivity, not 1.0 from interval analysis"
+        );
+    }
+
+    // `check_support` accepts `col0 > 50.0`, but the column statistics are
+    // malformed (`min_value` greater than `max_value`), so interval analysis
+    // fails. Computation then falls back to the rules on the children instead
+    // of failing, and no rule gives `>` a selectivity.
+    #[test]
+    fn analyze_error_falls_back_to_compute_from_children() {
+        let malformed_stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(5),
+                min_value: Precision::Exact(ScalarValue::Float64(Some(100.0))),
+                max_value: Precision::Exact(ScalarValue::Float64(Some(0.0))),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let schema = Schema::new(vec![Field::new("col0", DataType::Float64, true)]);
+        let ctx = SynopsisContext::new(&malformed_stats, &schema);
+
+        let gt: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("col0", 0)),
+            Operator::Gt,
+            lit(50.0_f64),
+        ));
+
+        assert_eq!(
+            ctx.compute(&gt).and_then(|s| s.selectivity),
+            None,
+            "no selectivity from interval analysis, which failed"
         );
     }
 }

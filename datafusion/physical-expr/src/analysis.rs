@@ -161,6 +161,8 @@ impl ExprBoundaries {
 /// # Returns
 ///
 /// * `AnalysisContext` constructed by pruned boundaries and a selectivity value.
+///   The selectivity is `None` when `expr` narrows a column that has no min or
+///   max, because the fraction of its values that remain cannot be computed.
 pub fn analyze(
     expr: &Arc<dyn PhysicalExpr>,
     context: AnalysisContext,
@@ -251,13 +253,17 @@ fn shrink_boundaries(
     }
 
     let selectivity = calculate_selectivity(&target_boundaries, &initial_boundaries)?;
+    let context = AnalysisContext::new(target_boundaries);
+    let Some(selectivity) = selectivity else {
+        return Ok(context);
+    };
 
     assert_or_internal_err!(
         (0.0..=1.0).contains(&selectivity),
         "Selectivity is out of limit: {selectivity}",
     );
 
-    Ok(AnalysisContext::new(target_boundaries).with_selectivity(selectivity))
+    Ok(context.with_selectivity(selectivity))
 }
 
 /// Returns `Some(1.0 / distinct_count)` when the filter demonstrably collapsed
@@ -304,7 +310,7 @@ fn singleton_selectivity(
 fn calculate_selectivity(
     target_boundaries: &[ExprBoundaries],
     initial_boundaries: &[ExprBoundaries],
-) -> Result<f64> {
+) -> Result<Option<f64>> {
     // Since the intervals are assumed uniform and the values
     // are not correlated, we need to multiply the selectivities
     // of multiple columns to get the overall selectivity.
@@ -328,6 +334,14 @@ fn calculate_selectivity(
                     acc *= s;
                     continue;
                 }
+                // A narrowed column without a min or a max gives no ratio to
+                // compute, so the selectivity is unknown.
+                if initial_interval != target_interval
+                    && (initial_interval.lower().is_null()
+                        || initial_interval.upper().is_null())
+                {
+                    return Ok(None);
+                }
                 acc *= cardinality_ratio(initial_interval, target_interval);
             }
             (None, Some(_)) => {
@@ -335,11 +349,11 @@ fn calculate_selectivity(
                     "Initial boundary cannot be None while having a Some() target boundary"
                 );
             }
-            _ => return Ok(0.0),
+            _ => return Ok(Some(0.0)),
         }
     }
 
-    Ok(acc)
+    Ok(Some(acc))
 }
 
 #[cfg(test)]
@@ -555,6 +569,42 @@ mod tests {
         );
     }
 
+    // On a column with no min or max, `analyze()` still narrows the column but
+    // gives no selectivity, because the fraction of values that remain cannot
+    // be computed. A single value with a known distinct count keeps `1/NDV`.
+    #[test]
+    fn test_analyze_without_bounds_has_no_selectivity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).unwrap();
+        let analyze_expr = |expr: Expr, distinct_count: Precision<usize>| {
+            let mut boundaries = ExprBoundaries::try_new_unbounded(&schema).unwrap();
+            boundaries[0].distinct_count = distinct_count;
+            let physical_expr = create_physical_expr(
+                &expr,
+                &df_schema,
+                &ExecutionProps::new(),
+                &PhysicalPlanningContext::default(),
+            )
+            .unwrap();
+            analyze(
+                &physical_expr,
+                AnalysisContext::new(boundaries),
+                df_schema.as_ref(),
+            )
+            .unwrap()
+        };
+
+        let gt = analyze_expr(col("b").gt(lit(0)), Precision::Absent);
+        assert_eq!(gt.selectivity, None);
+        assert!(
+            gt.boundaries[0].interval.is_some(),
+            "the column is still narrowed"
+        );
+
+        let eq = analyze_expr(col("b").eq(lit(5)), Precision::Exact(10));
+        assert_eq!(eq.selectivity, Some(0.1));
+    }
+
     /// Regression test: `calculate_selectivity` must not apply the `1/NDV`
     /// shortcut when the column statistics already describe a singleton interval
     /// (i.e. before the filter, the column only ever held one value).  In that
@@ -568,12 +618,15 @@ mod tests {
             std::slice::from_ref(&already_singleton),
             std::slice::from_ref(&already_singleton),
         )
-        .unwrap();
+        .unwrap()
+        .expect("a bounded column has a selectivity");
 
         let wide_initial = make_boundary(1, 100, 50);
         let same_singleton_target = make_boundary(7, 7, 50);
         let selectivity_new =
-            calculate_selectivity(&[same_singleton_target], &[wide_initial]).unwrap();
+            calculate_selectivity(&[same_singleton_target], &[wide_initial])
+                .unwrap()
+                .expect("a bounded column has a selectivity");
         assert!(
             (selectivity_new - 0.02).abs() < 1e-10,
             "expected selectivity 1/NDV = 0.02, got {selectivity_new}"
@@ -582,7 +635,9 @@ mod tests {
         let singleton_initial = make_boundary(7, 7, 50);
         let singleton_target = make_boundary(7, 7, 50);
         let selectivity_no_new_filter =
-            calculate_selectivity(&[singleton_target], &[singleton_initial]).unwrap();
+            calculate_selectivity(&[singleton_target], &[singleton_initial])
+                .unwrap()
+                .expect("a bounded column has a selectivity");
         assert!(
             (selectivity_no_new_filter - 1.0).abs() < 1e-10,
             "expected selectivity 1.0 when initial was already the same singleton, got {selectivity_no_new_filter}"
