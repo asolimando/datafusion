@@ -47,6 +47,7 @@ mod scalar_function;
 pub mod scalar_subquery;
 pub mod simplifier;
 pub mod statistics;
+pub mod synopsis_registry;
 pub mod utils;
 pub mod window;
 
