@@ -76,6 +76,7 @@
 //!     .compute_extended(plan.as_ref(), &StatisticsArgs::new())?;
 //! ```
 
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
@@ -131,8 +132,11 @@ pub use datafusion_physical_expr_common::synopsis::ExprSynopsis;
 pub struct ExtendedStatistics {
     /// Standard statistics (num_rows, byte_size, column stats)
     base: Arc<Statistics>,
-    /// Type-erased extensions for custom statistics
+    /// Type-erased extensions for custom statistics, scoped to the node as a whole.
     extensions: Extensions,
+    /// Type-erased extensions scoped to one output column, keyed by column
+    /// index.
+    column_extensions: HashMap<usize, Extensions>,
 }
 
 impl ExtendedStatistics {
@@ -141,6 +145,7 @@ impl ExtendedStatistics {
         Self {
             base: Arc::new(base),
             extensions: Extensions::new(),
+            column_extensions: HashMap::new(),
         }
     }
 
@@ -149,6 +154,7 @@ impl ExtendedStatistics {
         Self {
             base,
             extensions: Extensions::new(),
+            column_extensions: HashMap::new(),
         }
     }
 
@@ -182,17 +188,56 @@ impl ExtendedStatistics {
         self.extensions.merge(&other.extensions);
     }
 
-    /// Create from base statistics plus an existing extension map.
+    /// Get a reference to a custom statistics extension attached to one output
+    /// column by type.
+    pub fn get_column_extension<T: 'static + Send + Sync>(
+        &self,
+        column: usize,
+    ) -> Option<&T> {
+        self.column_extensions.get(&column)?.get::<T>()
+    }
+
+    /// Set a custom statistics extension for one output column.
+    pub fn set_column_extension<T: 'static + Send + Sync>(
+        &mut self,
+        column: usize,
+        value: T,
+    ) {
+        self.column_extensions
+            .entry(column)
+            .or_default()
+            .insert(value);
+    }
+
+    /// Check if an extension of the given type exists for one output column.
+    pub fn has_column_extension<T: 'static + Send + Sync>(&self, column: usize) -> bool {
+        self.column_extensions
+            .get(&column)
+            .is_some_and(|extensions| extensions.contains::<T>())
+    }
+
+    /// Create from base statistics plus existing node-level and column-level
+    /// extension maps.
     pub(crate) fn new_with_extensions(
         base: Arc<Statistics>,
         extensions: Extensions,
+        column_extensions: HashMap<usize, Extensions>,
     ) -> Self {
-        Self { base, extensions }
+        Self {
+            base,
+            extensions,
+            column_extensions,
+        }
     }
 
-    /// Returns the extension map.
-    pub(crate) fn extensions(&self) -> &Extensions {
+    /// Returns the node-level extension map.
+    pub fn extensions(&self) -> &Extensions {
         &self.extensions
+    }
+
+    /// Returns the column-level extension map, keyed by output column index.
+    pub fn column_extensions(&self) -> &HashMap<usize, Extensions> {
+        &self.column_extensions
     }
 }
 

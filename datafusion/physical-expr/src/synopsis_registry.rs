@@ -1660,4 +1660,151 @@ mod tests {
         assert_eq!(synopsis.column.min_value, always_true);
         assert_eq!(synopsis.column.max_value, always_true);
     }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct MiniSketch(Vec<i32>);
+
+    /// Attaches a sketch to column `x`, as a catalog that stores sketches
+    /// would.
+    #[derive(Debug)]
+    struct AttachSketch;
+    impl SynopsisProvider for AttachSketch {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(col) = expr.downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            if col.name() == "x" {
+                let mut s = ExprSynopsis::from_column(
+                    ColumnStatistics {
+                        distinct_count: Precision::Exact(5),
+                        ..ColumnStatistics::new_unknown()
+                    },
+                    DataType::Int32,
+                );
+                s.set_extension(MiniSketch(vec![1, 2, 3]));
+                return SynopsisResult::Computed(s);
+            }
+            SynopsisResult::Delegate
+        }
+    }
+
+    // An extension that a provider attaches to a column stays on that
+    // column's synopsis. A widening `CastExpr` above it carries the distinct
+    // count through but not the extension, because a built-in rule cannot
+    // transform an opaque sketch.
+    #[test]
+    fn extensions_ride_along_column_and_do_not_survive_cast() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let registry = SynopsisRegistry::with_providers(vec![Arc::new(AttachSketch)]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let x: Arc<dyn PhysicalExpr> = Arc::new(Column::new("x", 0));
+        let syn = ctx.compute(&x).expect("synopsis for x");
+        assert_eq!(
+            syn.get_extension::<MiniSketch>(),
+            Some(&MiniSketch(vec![1, 2, 3])),
+            "sketch rides the column synopsis"
+        );
+
+        let cast_x: Arc<dyn PhysicalExpr> =
+            Arc::new(CastExpr::new(x, DataType::Int64, None));
+        let cast_syn = ctx
+            .compute(&cast_x)
+            .expect("a widening cast has a rule, so a synopsis exists");
+        assert_eq!(
+            cast_syn.column.distinct_count,
+            Precision::Exact(5),
+            "the widening cast carries the distinct count through"
+        );
+        assert!(
+            !cast_syn.has_extension::<MiniSketch>(),
+            "the extension does not survive the built-in cast rule"
+        );
+    }
+
+    /// Understands `CastExpr` over a column carrying a `MiniSketch`: computes
+    /// the child through the context, scales the sketch's values, and attaches
+    /// the transformed sketch to the cast itself.
+    #[derive(Debug)]
+    struct ScaleSketchOnCast {
+        factor: i32,
+    }
+    impl SynopsisProvider for ScaleSketchOnCast {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(cast) = expr.downcast_ref::<CastExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(child_synopsis) = ctx.compute(cast.expr()) else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(child_sketch) = child_synopsis.get_extension::<MiniSketch>() else {
+                return SynopsisResult::Delegate;
+            };
+            let scaled =
+                MiniSketch(child_sketch.0.iter().map(|v| v * self.factor).collect());
+            let mut synopsis = ExprSynopsis::from_column(
+                ColumnStatistics::new_unknown(),
+                DataType::Int64,
+            );
+            synopsis.set_extension(scaled);
+            SynopsisResult::Computed(synopsis)
+        }
+    }
+
+    // A provider that understands an opaque sketch can attach a transformed
+    // version of the child's sketch to the parent expression.
+    #[test]
+    fn provider_transforms_sketch_across_cast() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let registry = SynopsisRegistry::with_providers(vec![
+            Arc::new(ScaleSketchOnCast { factor: 10 }),
+            Arc::new(AttachSketch),
+        ]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let x: Arc<dyn PhysicalExpr> = Arc::new(Column::new("x", 0));
+        let child_sketch = ctx
+            .compute(&x)
+            .expect("synopsis for x")
+            .get_extension::<MiniSketch>()
+            .expect("sketch attached to x")
+            .clone();
+
+        let cast_x: Arc<dyn PhysicalExpr> =
+            Arc::new(CastExpr::new(x, DataType::Int64, None));
+        let cast_sketch = ctx
+            .compute(&cast_x)
+            .expect("ScaleSketchOnCast supplies a synopsis for the cast")
+            .get_extension::<MiniSketch>()
+            .expect("transformed sketch attached to the cast")
+            .clone();
+
+        assert_eq!(
+            cast_sketch,
+            MiniSketch(vec![10, 20, 30]),
+            "the sketch arriving at the cast is the transformed one"
+        );
+        assert_ne!(
+            cast_sketch, child_sketch,
+            "the transform is observable: the cast's sketch differs from the child's"
+        );
+    }
 }

@@ -23,7 +23,7 @@
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --example statistics -- [all|join_reorder|tenant_skew|aggregate_synopsis_ndv]
+//! cargo run --example statistics -- [all|join_reorder|tenant_skew|aggregate_synopsis_ndv|join_sketch_synopsis]
 //! ```
 //!
 //! Each subcommand runs a corresponding example:
@@ -37,9 +37,13 @@
 //!
 //! - `aggregate_synopsis_ndv`
 //!   (file: aggregate_synopsis_ndv.rs, desc: Estimate GROUP BY date_trunc(...) cardinality from an expression-level provider, in one-stage and two-phase plans)
+//!
+//! - `join_sketch_synopsis`
+//!   (file: join_sketch_synopsis.rs, desc: Carry a set-backed sketch through the join key synopsis to correct a join row estimate an NDV formula gets wrong)
 
 mod aggregate_synopsis_ndv;
 mod join_reorder;
+mod join_sketch_synopsis;
 mod tenant_skew;
 
 use datafusion::error::{DataFusionError, Result};
@@ -53,6 +57,7 @@ enum ExampleKind {
     JoinReorder,
     TenantSkew,
     AggregateSynopsisNdv,
+    JoinSketchSynopsis,
 }
 
 impl ExampleKind {
@@ -75,6 +80,9 @@ impl ExampleKind {
             ExampleKind::TenantSkew => tenant_skew::tenant_skew().await,
             ExampleKind::AggregateSynopsisNdv => {
                 aggregate_synopsis_ndv::aggregate_synopsis_ndv().await
+            }
+            ExampleKind::JoinSketchSynopsis => {
+                join_sketch_synopsis::join_sketch_synopsis().await
             }
         }
     }

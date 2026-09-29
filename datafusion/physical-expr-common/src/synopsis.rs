@@ -121,6 +121,21 @@ impl ExprSynopsis {
             Precision::Absent => None,
         }
     }
+
+    /// Gets a reference to a custom statistics extension by type.
+    pub fn get_extension<T: 'static + Send + Sync>(&self) -> Option<&T> {
+        self.extensions.get::<T>()
+    }
+
+    /// Sets a custom statistics extension.
+    pub fn set_extension<T: 'static + Send + Sync>(&mut self, value: T) {
+        self.extensions.insert(value);
+    }
+
+    /// Checks whether an extension of the given type is present.
+    pub fn has_extension<T: 'static + Send + Sync>(&self) -> bool {
+        self.extensions.contains::<T>()
+    }
 }
 
 /// Per-call input to [`PhysicalExpr::synopsis_from_inputs`]: the

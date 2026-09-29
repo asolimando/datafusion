@@ -21,14 +21,19 @@
 //! [`ExecutionPlan::statistics_from_inputs`].
 
 use crate::ExecutionPlan;
+use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::displayable;
 use crate::operator_statistics::{
     ExtendedStatistics, StatisticsRegistry, StatisticsResult,
 };
+use crate::projection::ProjectionExec;
+use crate::repartition::RepartitionExec;
+use crate::sorts::sort::SortExec;
 use datafusion_common::extensions::Extensions;
 use datafusion_common::{
     Result, Statistics, assert_eq_or_internal_err, assert_or_internal_err,
 };
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 use log::debug;
 use std::cell::RefCell;
@@ -46,6 +51,14 @@ fn cache_key(plan: &dyn ExecutionPlan, partition: Option<usize>) -> CacheKey {
     )
 }
 
+/// A provider's node-level and column-level extensions for one node, cached
+/// together since they are always produced and consumed as a pair.
+#[derive(Debug, Default, Clone)]
+struct NodeExtensions {
+    node: Extensions,
+    columns: HashMap<usize, Extensions>,
+}
+
 /// Per-call memoization cache for statistics computation.
 ///
 /// Keyed by `(plan node pointer address, partition)`. Shared across
@@ -57,12 +70,12 @@ fn cache_key(plan: &dyn ExecutionPlan, partition: Option<usize>) -> CacheKey {
 ///
 /// Core statistics and provider extensions are cached separately: the
 /// `statistics` map is the hot path (populated on every walk); the `extensions`
-/// map is populated only when a provider returns non-empty extensions, so a walk
-/// with no providers never touches it.
+/// map is populated only when a provider returns non-empty node-level or
+/// column-level extensions, so a walk with no providers never touches it.
 #[derive(Debug, Default)]
 struct StatsCache {
     statistics: HashMap<CacheKey, Arc<Statistics>>,
-    extensions: HashMap<CacheKey, Extensions>,
+    extensions: HashMap<CacheKey, NodeExtensions>,
 }
 
 /// Fields of [`StatisticsArgs`] that every node in a walk inherits, unlike
@@ -156,11 +169,14 @@ pub enum ChildStats {
 /// [`ExecutionPlan::statistics_from_inputs`]. An empty registry is the built-in
 /// computation.
 ///
-/// The walk carries [`ExtendedStatistics`]. A node has extensions only if a
-/// provider `Computed` them for it; a node that falls back to the built-in
-/// [`ExecutionPlan::statistics_from_inputs`] has none. So extensions propagate
-/// upward only through an unbroken chain of provider-handled nodes: a single
-/// built-in node yields no extensions and hides those of everything beneath it.
+/// The walk carries [`ExtendedStatistics`], which holds both node-level
+/// extensions and column-level extensions keyed by output column index. A node
+/// has extensions only if a provider `Computed` them for it, with one
+/// exception: a built-in node that moves values without changing them or the
+/// rows (a projection, a coalesce, a sort or a repartition without a limit)
+/// carries its child's column extensions to the output columns that hold the
+/// same values. Any other built-in node yields no extensions and hides those of
+/// everything beneath it.
 /// [`Self::compute_extended`] observes extensions; [`Self::compute`] returns core
 /// [`Statistics`] only.
 pub struct StatisticsContext {
@@ -267,7 +283,9 @@ impl StatisticsContext {
             .cached_extensions(plan, args.partition())
             .unwrap_or_default();
         Ok(Arc::new(ExtendedStatistics::new_with_extensions(
-            statistics, extensions,
+            statistics,
+            extensions.node,
+            extensions.columns,
         )))
     }
 
@@ -325,7 +343,9 @@ impl StatisticsContext {
                 self.validate_child_requests(plan, &children, &requests)?;
                 let child_statistics =
                     self.resolve_children(plan, &children, &requests, args)?;
-                plan.statistics_from_inputs(&child_statistics, args)?
+                let statistics = plan.statistics_from_inputs(&child_statistics, args)?;
+                self.forward_column_extensions(plan, &children, &requests, partition);
+                statistics
             }
         };
         self.store_statistics(plan, partition, Arc::clone(&statistics));
@@ -441,13 +461,77 @@ impl StatisticsContext {
             if let StatisticsResult::Computed(computed) =
                 provider.compute_statistics_with_args(plan, &child_extended, args)?
             {
-                if !computed.extensions().is_empty() {
-                    self.store_extensions(plan, partition, computed.extensions().clone());
+                if !computed.extensions().is_empty()
+                    || !computed.column_extensions().is_empty()
+                {
+                    self.store_extensions(
+                        plan,
+                        partition,
+                        computed.extensions().clone(),
+                        computed.column_extensions().clone(),
+                    );
                 }
                 return Ok(Some(Arc::clone(computed.base_arc())));
             }
         }
         Ok(None)
+    }
+
+    /// Carries the child's column extensions through a built-in operator that
+    /// moves values without changing them or the rows: a projection keeps them
+    /// on each output column that is an input column, and a repartition (for
+    /// the whole output), coalesce or sort without a limit keeps them on the
+    /// same column. Any other built-in operator drops them, since an extension
+    /// of unknown type need not stay valid when rows change.
+    fn forward_column_extensions(
+        &self,
+        plan: &dyn ExecutionPlan,
+        children: &[&Arc<dyn ExecutionPlan>],
+        requests: &[ChildStats],
+        partition: Option<usize>,
+    ) {
+        let ([child], [ChildStats::At(child_partition)]) = (children, requests) else {
+            return;
+        };
+        let Some(child_extensions) =
+            self.cached_extensions(child.as_ref(), *child_partition)
+        else {
+            return;
+        };
+        let columns: HashMap<usize, Extensions> =
+            if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+                let Ok(mapping) = projection
+                    .projection_expr()
+                    .projection_mapping(&child.schema())
+                else {
+                    return;
+                };
+                mapping
+                    .iter()
+                    .filter_map(|(source, targets)| {
+                        let column = source.downcast_ref::<Column>()?;
+                        let extensions = child_extensions.columns.get(&column.index())?;
+                        Some(
+                            targets
+                                .iter()
+                                .map(|(_, output)| (*output, extensions.clone())),
+                        )
+                    })
+                    .flatten()
+                    .collect()
+            } else if plan.fetch().is_none()
+                && (plan.downcast_ref::<CoalescePartitionsExec>().is_some()
+                    || plan.downcast_ref::<SortExec>().is_some()
+                    || (partition.is_none()
+                        && plan.downcast_ref::<RepartitionExec>().is_some()))
+            {
+                child_extensions.columns
+            } else {
+                return;
+            };
+        if !columns.is_empty() {
+            self.store_extensions(plan, partition, Extensions::default(), columns);
+        }
     }
 
     /// Pairs each child's core statistics with any extensions cached for it,
@@ -471,7 +555,8 @@ impl StatisticsContext {
                 match extensions {
                     Some(extensions) => ExtendedStatistics::new_with_extensions(
                         Arc::clone(statistics),
-                        extensions,
+                        extensions.node,
+                        extensions.columns,
                     ),
                     None => ExtendedStatistics::new_arc(Arc::clone(statistics)),
                 }
@@ -507,7 +592,7 @@ impl StatisticsContext {
         &self,
         plan: &dyn ExecutionPlan,
         partition: Option<usize>,
-    ) -> Option<Extensions> {
+    ) -> Option<NodeExtensions> {
         self.cache
             .borrow()
             .extensions
@@ -520,23 +605,29 @@ impl StatisticsContext {
         plan: &dyn ExecutionPlan,
         partition: Option<usize>,
         extensions: Extensions,
+        column_extensions: HashMap<usize, Extensions>,
     ) {
-        self.cache
-            .borrow_mut()
-            .extensions
-            .insert(cache_key(plan, partition), extensions);
+        self.cache.borrow_mut().extensions.insert(
+            cache_key(plan, partition),
+            NodeExtensions {
+                node: extensions,
+                columns: column_extensions,
+            },
+        );
     }
 }
 
 #[cfg(all(test, feature = "test_utils"))]
 mod tests {
     use super::*;
-    use crate::coalesce_partitions::CoalescePartitionsExec;
+    use crate::filter::FilterExec;
     use crate::operator_statistics::StatisticsProvider;
     use crate::test::exec::StatisticsExec;
     use crate::union::UnionExec;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::{ColumnStatistics, stats::Precision};
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
 
     /// Overall-only provider: sets a fixed row count for any node.
     #[derive(Debug)]
@@ -731,6 +822,175 @@ mod tests {
             .unwrap();
         assert_eq!(parent_extended.get_extension::<Tag>(), None);
         assert_eq!(parent_extended.base().num_rows, Precision::Exact(100));
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ColumnTag(u32);
+
+    /// Leaf provider: sets a row count and attaches a `ColumnTag` extension to
+    /// output column 0.
+    #[derive(Debug)]
+    struct ColumnTagLeafProvider {
+        rows: usize,
+        tag: u32,
+    }
+    impl StatisticsProvider for ColumnTagLeafProvider {
+        fn compute_statistics(
+            &self,
+            plan: &dyn ExecutionPlan,
+            child_stats: &[ExtendedStatistics],
+        ) -> Result<StatisticsResult> {
+            if !child_stats.is_empty() {
+                return Ok(StatisticsResult::Delegate);
+            }
+            let mut stats = Statistics::new_unknown(&plan.schema());
+            stats.num_rows = Precision::Exact(self.rows);
+            let mut extended = ExtendedStatistics::new(stats);
+            extended.set_column_extension(0, ColumnTag(self.tag));
+            Ok(StatisticsResult::Computed(extended))
+        }
+    }
+
+    /// Non-leaf provider: passes the first child's `ExtendedStatistics` through
+    /// unchanged, so a column extension attached below it reaches this node
+    /// only if the walk carries it there.
+    #[derive(Debug)]
+    struct ColumnTagPassthroughProvider;
+    impl StatisticsProvider for ColumnTagPassthroughProvider {
+        fn compute_statistics(
+            &self,
+            _plan: &dyn ExecutionPlan,
+            child_stats: &[ExtendedStatistics],
+        ) -> Result<StatisticsResult> {
+            let Some(first) = child_stats.first() else {
+                return Ok(StatisticsResult::Delegate);
+            };
+            Ok(StatisticsResult::Computed(first.clone()))
+        }
+    }
+
+    /// Attaches a `ColumnTag` to output column 1 of a leaf.
+    #[derive(Debug)]
+    struct TagSecondColumn;
+    impl StatisticsProvider for TagSecondColumn {
+        fn compute_statistics(
+            &self,
+            plan: &dyn ExecutionPlan,
+            child_stats: &[ExtendedStatistics],
+        ) -> Result<StatisticsResult> {
+            if !child_stats.is_empty() {
+                return Ok(StatisticsResult::Delegate);
+            }
+            let mut extended =
+                ExtendedStatistics::new(Statistics::new_unknown(&plan.schema()));
+            extended.set_column_extension(1, ColumnTag(7));
+            Ok(StatisticsResult::Computed(extended))
+        }
+    }
+
+    // A built-in projection, which here removes `a`, inserts a computed column
+    // and repeats `b`, carries a column extension to every output column that
+    // holds the same values, and so does a coalesce. A filter, which removes
+    // rows, drops it.
+    #[test]
+    fn column_extension_follows_its_column_through_value_preserving_operators()
+    -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(StatisticsExec::new(
+            Statistics::new_unknown(&schema),
+            schema.clone(),
+        ));
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            vec![
+                (col("b", &schema)?, "b".to_string()),
+                (
+                    Arc::new(BinaryExpr::new(
+                        col("a", &schema)?,
+                        Operator::Plus,
+                        lit(1i32),
+                    )),
+                    "c".to_string(),
+                ),
+                (col("b", &schema)?, "b2".to_string()),
+            ],
+            leaf,
+        )?);
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(Arc::clone(&projection)));
+        let ctx = ctx_with(Arc::new(TagSecondColumn));
+
+        let out = ctx.compute_extended(coalesce.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(
+            out.get_column_extension::<ColumnTag>(0),
+            Some(&ColumnTag(7))
+        );
+        assert_eq!(out.get_column_extension::<ColumnTag>(1), None);
+        assert_eq!(
+            out.get_column_extension::<ColumnTag>(2),
+            Some(&ColumnTag(7))
+        );
+
+        let predicate = Arc::new(BinaryExpr::new(
+            col("b", &projection.schema())?,
+            Operator::Gt,
+            lit(0i32),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, coalesce)?);
+        let out = ctx.compute_extended(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(out.get_column_extension::<ColumnTag>(0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn column_extension_reaches_provider_parent_but_drops_at_builtin_filter() {
+        let leaf = make_stats_leaf(100);
+        let parent: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(Arc::clone(&leaf)));
+
+        // A provider-handled parent preserves the column extension published
+        // at the leaf.
+        let ctx = StatisticsContext::new_with_registry(
+            StatisticsRegistry::with_providers(vec![
+                Arc::new(ColumnTagLeafProvider { rows: 100, tag: 9 }),
+                Arc::new(ColumnTagPassthroughProvider),
+            ]),
+        );
+        let leaf_extended = ctx
+            .compute_extended(leaf.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(
+            leaf_extended.get_column_extension::<ColumnTag>(0),
+            Some(&ColumnTag(9))
+        );
+        let parent_extended = ctx
+            .compute_extended(parent.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(
+            parent_extended.get_column_extension::<ColumnTag>(0),
+            Some(&ColumnTag(9))
+        );
+
+        // A built-in node that removes rows drops the column extension, the
+        // same rule as for node-level extensions.
+        let predicate = Arc::new(BinaryExpr::new(
+            col("a", &leaf.schema()).unwrap(),
+            Operator::Gt,
+            lit(0i32),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, Arc::clone(&leaf)).unwrap());
+        let builtin_ctx = ctx_with(Arc::new(ColumnTagLeafProvider { rows: 100, tag: 9 }));
+        let builtin_filter_extended = builtin_ctx
+            .compute_extended(filter.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(
+            builtin_filter_extended.get_column_extension::<ColumnTag>(0),
+            None
+        );
     }
 
     #[test]

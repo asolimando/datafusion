@@ -225,6 +225,7 @@ cargo run --example dataframe -- dataframe
 | join_reorder           | [`statistics/join_reorder.rs`](examples/statistics/join_reorder.rs)                     | Supply and refine column statistics via a provider to flip a join order                                           |
 | tenant_skew            | [`statistics/tenant_skew.rs`](examples/statistics/tenant_skew.rs)                       | Plug a per-tenant row count into filter selectivity via the SynopsisRegistry                                      |
 | aggregate_synopsis_ndv | [`statistics/aggregate_synopsis_ndv.rs`](examples/statistics/aggregate_synopsis_ndv.rs) | Estimate GROUP BY date_trunc(...) cardinality from an expression-level provider, in one-stage and two-phase plans |
+| join_sketch_synopsis   | [`statistics/join_sketch_synopsis.rs`](examples/statistics/join_sketch_synopsis.rs)     | Carry a set-backed sketch through the join key synopsis to correct a join row estimate an NDV formula gets wrong  |
 
 ## UDF Examples
 
