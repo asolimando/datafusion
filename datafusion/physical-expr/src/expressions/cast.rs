@@ -30,10 +30,11 @@ use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::nested_struct::{
     requires_nested_struct_cast, validate_data_type_compatibility,
 };
-use datafusion_common::{Result, not_impl_err};
+use datafusion_common::{ColumnStatistics, Result, not_impl_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::ExprProperties;
+use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
 const DEFAULT_CAST_OPTIONS: CastOptions<'static> = CastOptions {
     safe: false,
@@ -417,6 +418,31 @@ impl PhysicalExpr for CastExpr {
     fn evaluate_bounds(&self, children: &[&Interval]) -> Result<Interval> {
         // Cast current node's interval to the right type:
         children[0].cast_to(self.cast_type(), &self.cast_options)
+    }
+
+    // A cast that is lossless and strictly order-preserving (see
+    // [`Self::is_bigger_cast`]) carries the child's distinct count and null
+    // count over, with their `Precision`.
+    fn synopsis_from_inputs(
+        &self,
+        _args: &SynopsisArgs,
+        child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        let [child] = child_synopses else {
+            return None;
+        };
+        if !self.is_bigger_cast(&child.data_type) {
+            return None;
+        }
+        let column = ColumnStatistics {
+            distinct_count: child.column.distinct_count,
+            null_count: child.column.null_count,
+            ..ColumnStatistics::new_unknown()
+        };
+        Some(ExprSynopsis {
+            column,
+            ..ExprSynopsis::unknown(self.cast_type().clone())
+        })
     }
 
     fn propagate_constraints(

@@ -697,7 +697,7 @@ fn conform(mut synopsis: ExprSynopsis, data_type: &DataType) -> Option<ExprSynop
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{BinaryExpr, Column, LikeExpr, NotExpr, lit};
+    use crate::expressions::{BinaryExpr, CastExpr, Column, LikeExpr, NotExpr, lit};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, ScalarValue};
@@ -1455,6 +1455,42 @@ mod tests {
             ctx.compute(&gt).and_then(|s| s.selectivity),
             None,
             "no selectivity from interval analysis, which failed"
+        );
+    }
+
+    // A cast that is lossless and injective (here, a widening cast between
+    // signed integers) carries the child's distinct count over unchanged; a
+    // narrowing cast has no NDV rule, so its distinct count is absent, even
+    // though its range is still known from evaluate_bounds.
+    #[test]
+    fn cast_ndv_rule_widening_vs_narrowing() {
+        let (stats, schema) = one_col_stats(6, DataType::Int32);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("col0", 0));
+
+        let widen: Arc<dyn PhysicalExpr> =
+            Arc::new(CastExpr::new(Arc::clone(&a), DataType::Int64, None));
+        assert_eq!(
+            ctx.compute(&widen).map(|s| s.column.distinct_count),
+            Some(Precision::Exact(6)),
+            "a widening cast between signed integers preserves the count exactly"
+        );
+
+        let mut stats_with_nulls = stats.clone();
+        stats_with_nulls.column_statistics[0].null_count = Precision::Exact(3);
+        let ctx_with_nulls = SynopsisContext::new(&stats_with_nulls, &schema);
+        assert_eq!(
+            ctx_with_nulls.compute(&widen).map(|s| s.column.null_count),
+            Some(Precision::Exact(3)),
+            "a lossless cast keeps every NULL"
+        );
+
+        let narrow: Arc<dyn PhysicalExpr> =
+            Arc::new(CastExpr::new(a, DataType::Int16, None));
+        assert_eq!(
+            ctx.compute(&narrow).map(|s| s.column.distinct_count),
+            Some(Precision::Absent),
+            "a narrowing cast has no NDV rule"
         );
     }
 
