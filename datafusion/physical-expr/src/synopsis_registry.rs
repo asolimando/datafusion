@@ -345,6 +345,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn injective_ndv_rule_through_nested_expression_type_aware_and_unknown_fallback() {
+        let (float_stats, float_schema) = one_col_stats(42, DataType::Float64);
+        let float_ctx = SynopsisContext::new(&float_stats, &float_schema);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let a_plus_1: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Plus,
+            lit(1.0_f64),
+        ));
+        let nested: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a_plus_1, Operator::Minus, lit(2.0_f64)));
+        assert_eq!(
+            float_ctx.compute(&nested).map(|s| s.column.distinct_count),
+            Some(Precision::Inexact(42)),
+            "the count carries through both operators, inexact for a floating \
+             point column"
+        );
+
+        let a_mod_5: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a, Operator::Modulo, lit(5.0_f64)));
+        assert!(
+            float_ctx.compute(&a_mod_5).is_none(),
+            "Modulo has no rule, so it has an unknown synopsis even though both \
+             operands are known"
+        );
+
+        let (int_stats, int_schema) = one_col_stats(42, DataType::Int64);
+        let int_ctx = SynopsisContext::new(&int_stats, &int_schema);
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 0));
+        let b_plus_1: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(b, Operator::Plus, lit(1_i64)));
+        assert_eq!(
+            int_ctx.compute(&b_plus_1).map(|s| s.column.distinct_count),
+            Some(Precision::Exact(42)),
+            "the count carries through unchanged, exact for an integer column"
+        );
+
+        let b_plus_float: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 0)),
+            Operator::Plus,
+            lit(1.0_f64),
+        ));
+        assert_eq!(
+            int_ctx
+                .compute(&b_plus_float)
+                .map(|s| s.column.distinct_count),
+            Some(Precision::Inexact(42)),
+            "an integer operand with a floating point result is inexact"
+        );
+    }
+
+    // Adding a non-NULL constant is NULL exactly where the other operand is,
+    // so the result keeps that operand's null count.
+    #[test]
+    fn adding_a_constant_keeps_the_null_count() {
+        let (mut stats, schema) = one_col_stats(42, DataType::Int64);
+        stats.column_statistics[0].null_count = Precision::Exact(3);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let b_plus_1: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 0)),
+            Operator::Plus,
+            lit(1_i64),
+        ));
+        assert_eq!(
+            ctx.compute(&b_plus_1).map(|s| s.column.null_count),
+            Some(Precision::Exact(3))
+        );
+    }
+
+    // A NULL constant makes every result NULL, so the other operand's count
+    // carries over only as an estimate, even in integer arithmetic.
+    #[test]
+    fn adding_a_null_constant_is_inexact() {
+        let (stats, schema) = one_col_stats(42, DataType::Int64);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let b_plus_null: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 0)),
+            Operator::Plus,
+            lit(ScalarValue::Int64(None)),
+        ));
+        assert_eq!(
+            ctx.compute(&b_plus_null).map(|s| s.column.distinct_count),
+            Some(Precision::Inexact(42))
+        );
+    }
+
     /// Overrides any binary expression, so the built-in rule for it is bypassed.
     #[derive(Debug)]
     struct OverrideBinary {

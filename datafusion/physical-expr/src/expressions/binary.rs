@@ -32,7 +32,11 @@ use arrow::compute::{SlicesIterator, cast, filter_record_batch};
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
+use datafusion_common::stats::Precision;
+use datafusion_common::{
+    ColumnStatistics, Result, ScalarValue, internal_err, not_impl_err,
+};
+use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
 use datafusion_expr::binary::BinaryTypeCoercer;
 use datafusion_expr::interval_arithmetic::{Interval, apply_operator};
@@ -536,6 +540,27 @@ where
     }
 }
 
+/// Whether every row of the operand holds the same non-NULL value, as for a
+/// non-NULL literal.
+fn is_exact_constant(synopsis: &ExprSynopsis) -> bool {
+    synopsis.column.distinct_count == Precision::Exact(1)
+        && synopsis.column.null_count == Precision::Exact(0)
+}
+
+/// The null count of a binary expression that is NULL exactly when an operand
+/// is NULL, with a non-NULL constant on one side: the other side's null count.
+fn null_count_beside_constant(
+    left: &ExprSynopsis,
+    right: &ExprSynopsis,
+) -> Precision<usize> {
+    match (is_exact_constant(left), is_exact_constant(right)) {
+        (true, true) => Precision::Exact(0),
+        (true, false) => right.column.null_count,
+        (false, true) => left.column.null_count,
+        (false, false) => Precision::Absent,
+    }
+}
+
 impl PhysicalExpr for BinaryExpr {
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
         BinaryTypeCoercer::new(
@@ -544,6 +569,50 @@ impl PhysicalExpr for BinaryExpr {
             &self.right.data_type(input_schema)?,
         )
         .get_result_type()
+    }
+
+    fn synopsis_from_inputs(
+        &self,
+        args: &SynopsisArgs,
+        child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        let input_schema = args.input_schema();
+        let [left, right] = child_synopses else {
+            return None;
+        };
+        match self.op {
+            // Adding or subtracting a constant maps distinct operands onto
+            // distinct results. The count stays `Exact` only for integer
+            // arithmetic, which is a bijection even when it wraps, and a
+            // non-NULL constant. Otherwise it becomes `Inexact`: decimal and
+            // floating point arithmetic can round two operands onto one result,
+            // also for an integer operand as in `int64_column + 1.0`, and a NULL
+            // constant makes every result NULL.
+            Operator::Plus | Operator::Minus => {
+                let (constant, other) = match (left.ndv(), right.ndv()) {
+                    (Some(1), _) => (left, right),
+                    (_, Some(1)) => (right, left),
+                    _ => return None,
+                };
+                let output_type = self.data_type(input_schema).ok()?;
+                let distinct_count =
+                    if is_exact_constant(constant) && output_type.is_integer() {
+                        other.column.distinct_count
+                    } else {
+                        other.column.distinct_count.to_inexact()
+                    };
+                let column = ColumnStatistics {
+                    distinct_count,
+                    null_count: null_count_beside_constant(left, right),
+                    ..ColumnStatistics::new_unknown()
+                };
+                Some(ExprSynopsis {
+                    column,
+                    ..ExprSynopsis::unknown(output_type)
+                })
+            }
+            _ => None,
+        }
     }
 
     fn nullable(&self, input_schema: &Schema) -> Result<bool> {
