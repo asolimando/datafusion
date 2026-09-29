@@ -67,7 +67,6 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::filter_statistics::{
     collect_equality_columns, scale_byte_size_at_rows,
 };
-use datafusion_physical_expr::synopsis_registry::{SynopsisContext, SynopsisRegistry};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
     AcrossPartitions, ConstExpr, PhysicalExpr, conjunction, split_conjunction,
@@ -357,7 +356,7 @@ impl FilterExec {
         input_stats: Statistics,
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
-        synopsis_registry: &SynopsisRegistry,
+        args: &StatisticsArgs,
     ) -> Result<Statistics> {
         let (_, is_infeasible) = collect_equality_columns(predicate);
         if is_infeasible {
@@ -380,9 +379,9 @@ impl FilterExec {
         }
 
         let default_selectivity = default_selectivity as f64 / 100.0;
-        let synopsis_ctx =
-            SynopsisContext::new_with_registry(&input_stats, schema, synopsis_registry)
-                .with_default_selectivity(default_selectivity);
+        let synopsis_ctx = args
+            .synopsis_context(&input_stats, schema)
+            .with_default_selectivity(default_selectivity);
         let selectivity = synopsis_ctx
             .compute(predicate)
             .and_then(|synopsis| synopsis.selectivity)
@@ -443,7 +442,7 @@ impl FilterExec {
             ),
             predicate,
             default_selectivity,
-            &SynopsisRegistry::new(),
+            &StatisticsArgs::new(),
         )?;
         let mut eq_properties = input.equivalence_properties().clone();
         let (equal_pairs, _) = collect_columns_from_predicate_inner(predicate);
@@ -650,7 +649,7 @@ impl ExecutionPlan for FilterExec {
             input_stats[0].as_ref().clone(),
             self.predicate(),
             self.default_selectivity,
-            args.synopsis_registry(),
+            args,
         )?;
         Ok(Arc::new(stats.project(self.projection.as_ref())))
     }

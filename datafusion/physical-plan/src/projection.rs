@@ -54,7 +54,6 @@ use datafusion_expr::ExpressionPlacement;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
-use datafusion_physical_expr::synopsis_registry::SynopsisContext;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexRequirement, PhysicalSortExpr,
@@ -492,11 +491,7 @@ impl ExecutionPlan for ProjectionExec {
         let input_schema = self.input.schema();
         let output_schema = self.schema();
 
-        let synopsis_ctx = SynopsisContext::new_with_registry(
-            &input_stats,
-            input_schema.as_ref(),
-            args.synopsis_registry(),
-        );
+        let synopsis_ctx = args.synopsis_context(&input_stats, input_schema.as_ref());
 
         let stats = self
             .projector

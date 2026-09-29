@@ -2332,11 +2332,8 @@ impl ExecutionPlan for AggregateExec {
     ) -> Result<Arc<Statistics>> {
         let child_statistics = Arc::clone(&input_stats[0]);
         let input_schema = self.input().schema();
-        let synopsis_ctx = SynopsisContext::new_with_registry(
-            &child_statistics,
-            input_schema.as_ref(),
-            args.synopsis_registry(),
-        );
+        let synopsis_ctx =
+            args.synopsis_context(&child_statistics, input_schema.as_ref());
         Ok(Arc::new(self.statistics_inner(
             &child_statistics,
             args.partition(),

@@ -39,6 +39,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
+use datafusion_common::extensions::Extensions;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, Statistics};
 use datafusion_expr_common::interval_arithmetic::Interval;
@@ -74,7 +75,10 @@ pub enum SynopsisResult {
 ///
 /// A provider receives the [`SynopsisContext`], so it can compute
 /// sub-expressions through the whole chain, including the other providers,
-/// in the same way as the built-in rules.
+/// in the same way as the built-in rules. The context adds no extensions to a
+/// provider's answer: the provider decides them, and can read the input's
+/// through [`SynopsisContext::get_extension`] and
+/// [`SynopsisContext::get_column_extension`].
 pub trait SynopsisProvider: Debug + Send + Sync {
     /// Returns the synopsis of `expr`, or [`SynopsisResult::Delegate`] to
     /// leave `expr` to the next provider and then to the built-in rules.
@@ -161,6 +165,11 @@ pub struct SynopsisContext<'a> {
     /// every descendant) contains no provider answer.
     provider_free_cache: RefCell<HashMap<Arc<dyn PhysicalExpr>, bool>>,
     analysis_cache: RefCell<AnalysisCache>,
+    /// The input's node-level extensions, when the caller supplies them.
+    node_extensions: Option<&'a Extensions>,
+    /// The input's per-column extensions, keyed by column index, when the
+    /// caller supplies them.
+    column_extensions: Option<&'a HashMap<usize, Extensions>>,
     /// The precomputed facts about the condition in [`Self::args`], when the
     /// context was derived with [`Self::given`].
     condition_estimate: Option<ConditionEstimate>,
@@ -265,6 +274,8 @@ impl<'a> SynopsisContext<'a> {
             provider_cache: RefCell::new(HashMap::new()),
             provider_free_cache: RefCell::new(HashMap::new()),
             analysis_cache: RefCell::new(HashMap::new()),
+            node_extensions: None,
+            column_extensions: None,
             condition_estimate: None,
         }
     }
@@ -293,6 +304,8 @@ impl<'a> SynopsisContext<'a> {
             provider_cache: RefCell::new(HashMap::new()),
             provider_free_cache: RefCell::new(HashMap::new()),
             analysis_cache: RefCell::new(HashMap::new()),
+            node_extensions: self.node_extensions,
+            column_extensions: self.column_extensions,
             condition_estimate: Some(ConditionEstimate::new(
                 &args,
                 condition,
@@ -313,6 +326,36 @@ impl<'a> SynopsisContext<'a> {
     /// same ones the built-in rules see.
     pub fn args(&self) -> &SynopsisArgs<'a> {
         &self.args
+    }
+
+    /// Attach the input's node-level and per-column extensions, so a
+    /// provider can read metadata the input carries beyond plain
+    /// [`Statistics`] (for example, cross-column correlation).
+    pub fn with_extensions(
+        mut self,
+        node: &'a Extensions,
+        columns: &'a HashMap<usize, Extensions>,
+    ) -> Self {
+        self.node_extensions = Some(node);
+        self.column_extensions = Some(columns);
+        self
+    }
+
+    /// Get a reference to a node-level extension of the input, if the
+    /// context was built with [`Self::with_extensions`] and the input
+    /// carries one of type `T`.
+    pub fn get_extension<T: 'static + Send + Sync>(&self) -> Option<&T> {
+        self.node_extensions?.get::<T>()
+    }
+
+    /// Get a reference to an extension of type `T` that the input carries for
+    /// the column at `index`, if the context was built with
+    /// [`Self::with_extensions`].
+    pub fn get_column_extension<T: 'static + Send + Sync>(
+        &self,
+        index: usize,
+    ) -> Option<&T> {
+        self.column_extensions?.get(&index)?.get::<T>()
     }
 
     /// Computes the synopsis of `expr`, caching it by structural expression
@@ -442,6 +485,7 @@ impl<'a> SynopsisContext<'a> {
             synopsis = column;
         }
         synopsis.selectivity = Some(selectivity);
+        self.attach_column_extensions(expr, &mut synopsis);
         Some(synopsis)
     }
 
@@ -491,6 +535,10 @@ impl<'a> SynopsisContext<'a> {
                 data_type,
                 synopsis,
             );
+        }
+
+        if let Some(synopsis) = synopsis.as_mut() {
+            self.attach_column_extensions(expr, synopsis);
         }
         synopsis
     }
@@ -542,6 +590,27 @@ impl<'a> SynopsisContext<'a> {
         let column = expr.downcast_ref::<Column>()?;
         let statistics = estimate.column_statistics(column.index(), &self.args)?;
         Some(ExprSynopsis::from_column(statistics, data_type.clone()))
+    }
+
+    /// Merges in the per-column extensions that the input carries, for a
+    /// `Column` whose index has an entry. A built-in rule above a `Column`
+    /// cannot carry an opaque extension forward, so this is the only place
+    /// where a per-column extension enters a synopsis without a provider.
+    fn attach_column_extensions(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        synopsis: &mut ExprSynopsis,
+    ) {
+        let Some(column_extensions) = self.column_extensions else {
+            return;
+        };
+        let Some(column) = expr.downcast_ref::<Column>() else {
+            return;
+        };
+        let Some(extensions) = column_extensions.get(&column.index()) else {
+            return;
+        };
+        synopsis.extensions.merge(extensions);
     }
 
     /// Fills a missing distinct count with the number of values in the range,
@@ -1116,6 +1185,187 @@ mod tests {
         assert!(
             (sel - 0.1).abs() < 1e-9,
             "AND selectivity = 0.2 * 0.5 = {sel}"
+        );
+    }
+
+    /// A test-local stand-in for cross-column correlation metadata the input
+    /// might carry: two columns tend to satisfy their comparisons together
+    /// more often (or less often) than independence would predict.
+    #[derive(Debug)]
+    struct Correlation {
+        left: usize,
+        right: usize,
+        coefficient: f64,
+    }
+
+    /// Matches `left_col > c1 AND right_col > c2` and returns a selectivity
+    /// that blends the independent product with the correlation coefficient.
+    /// This is a simple test stand-in, not a real correlation model.
+    #[derive(Debug)]
+    struct CorrelatedAnd;
+
+    impl SynopsisProvider for CorrelatedAnd {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            if *binary.op() != Operator::And {
+                return SynopsisResult::Delegate;
+            }
+            let Some(left_cmp) = binary.left().downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(right_cmp) = binary.right().downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(left_col) = left_cmp.left().downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(right_col) = right_cmp.left().downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+
+            let Some(left_sel) = ctx.compute(binary.left()).and_then(|s| s.selectivity)
+            else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(right_sel) = ctx.compute(binary.right()).and_then(|s| s.selectivity)
+            else {
+                return SynopsisResult::Delegate;
+            };
+            let Some(correlation) = ctx.get_extension::<Correlation>() else {
+                return SynopsisResult::Delegate;
+            };
+            if correlation.left != left_col.index()
+                || correlation.right != right_col.index()
+            {
+                return SynopsisResult::Delegate;
+            }
+
+            // Blend the independent product with the correlation coefficient,
+            // clamped to a valid selectivity. A real model would replace this.
+            let independent = left_sel * right_sel;
+            let blended = (independent
+                + correlation.coefficient * left_sel.min(right_sel))
+            .clamp(0.0, 1.0);
+            SynopsisResult::Computed(ExprSynopsis {
+                selectivity: Some(blended),
+                ..ExprSynopsis::unknown(DataType::Boolean)
+            })
+        }
+    }
+
+    // A provider that reads node-level correlation metadata through
+    // `SynopsisContext::get_extension` returns a selectivity for a
+    // conjunction that differs from the built-in estimate without that
+    // metadata.
+    #[test]
+    fn correlated_conjunction_uses_node_level_extension() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![cs(10, 0.0, 100.0), cs(10, 0.0, 100.0)],
+        };
+        let schema = Schema::new(vec![
+            Field::new("left", DataType::Float64, true),
+            Field::new("right", DataType::Float64, true),
+        ]);
+
+        let left: Arc<dyn PhysicalExpr> = Arc::new(Column::new("left", 0));
+        let right: Arc<dyn PhysicalExpr> = Arc::new(Column::new("right", 1));
+        let left_cmp: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(left, Operator::Gt, lit(5.0_f64)));
+        let right_cmp: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(right, Operator::Gt, lit(5.0_f64)));
+        let conjunction: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(left_cmp, Operator::And, right_cmp));
+
+        // Without the extension: interval analysis estimates the conjunction
+        // under independence.
+        let no_extensions_ctx = SynopsisContext::new(&stats, &schema);
+        let independent_sel = no_extensions_ctx
+            .compute(&conjunction)
+            .and_then(|s| s.selectivity)
+            .expect("the built-in estimate has a synopsis");
+
+        // With the extension: the provider blends in the correlation.
+        let node_extensions = {
+            let mut ext = Extensions::new();
+            ext.insert(Correlation {
+                left: 0,
+                right: 1,
+                coefficient: 0.3,
+            });
+            ext
+        };
+        let column_extensions = HashMap::new();
+        let registry = SynopsisRegistry::with_providers(vec![Arc::new(CorrelatedAnd)]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry)
+            .with_extensions(&node_extensions, &column_extensions);
+        let correlated_sel = ctx
+            .compute(&conjunction)
+            .and_then(|s| s.selectivity)
+            .expect("CorrelatedAnd answers using the correlation extension");
+
+        assert_ne!(
+            correlated_sel, independent_sel,
+            "the correlation extension changes the selectivity away from the \
+             independent product"
+        );
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ColumnSketch(u64);
+
+    // A `Column` picks up the per-column extensions that the input carries
+    // for its index, with no provider involved, but an expression above it
+    // does not. A context built without extensions attaches nothing.
+    #[test]
+    fn column_carries_its_per_column_extensions() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let schema = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+
+        let node_extensions = Extensions::new();
+        let mut column_extensions = HashMap::new();
+        let mut col0_extensions = Extensions::new();
+        col0_extensions.insert(ColumnSketch(42));
+        column_extensions.insert(0, col0_extensions);
+
+        let ctx = SynopsisContext::new(&stats, &schema)
+            .with_extensions(&node_extensions, &column_extensions);
+
+        let x: Arc<dyn PhysicalExpr> = Arc::new(Column::new("x", 0));
+        let synopsis = ctx.compute(&x).expect("Column has a synopsis");
+        assert_eq!(
+            synopsis.get_extension::<ColumnSketch>(),
+            Some(&ColumnSketch(42)),
+            "the per-column extension is attached to the Column synopsis"
+        );
+
+        let plus_one: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(x, Operator::Plus, lit(1_i64)));
+        let plus_one_synopsis = ctx.compute(&plus_one).expect("Plus has a synopsis");
+        assert!(
+            !plus_one_synopsis.has_extension::<ColumnSketch>(),
+            "the built-in Plus rule does not carry the extension forward"
+        );
+
+        let no_extensions_ctx = SynopsisContext::new(&stats, &schema);
+        let x_again: Arc<dyn PhysicalExpr> = Arc::new(Column::new("x", 0));
+        let no_extensions_synopsis = no_extensions_ctx
+            .compute(&x_again)
+            .expect("Column has a synopsis");
+        assert!(
+            !no_extensions_synopsis.has_extension::<ColumnSketch>(),
+            "a context built without extensions attaches nothing by default"
         );
     }
 

@@ -29,12 +29,13 @@ use crate::operator_statistics::{
 use crate::projection::ProjectionExec;
 use crate::repartition::RepartitionExec;
 use crate::sorts::sort::SortExec;
+use arrow::datatypes::Schema;
 use datafusion_common::extensions::Extensions;
 use datafusion_common::{
     Result, Statistics, assert_eq_or_internal_err, assert_or_internal_err,
 };
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
+use datafusion_physical_expr::synopsis_registry::{SynopsisContext, SynopsisRegistry};
 use log::debug;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -92,6 +93,8 @@ struct WalkScoped {
 pub struct StatisticsArgs {
     partition: Option<usize>,
     walk: WalkScoped,
+    /// The extensions of the node's single input, when it has any.
+    input_extensions: Option<Arc<NodeExtensions>>,
 }
 
 impl StatisticsArgs {
@@ -146,6 +149,27 @@ impl StatisticsArgs {
         Self {
             partition,
             walk: self.walk.clone(),
+            input_extensions: None,
+        }
+    }
+
+    /// A [`SynopsisContext`] over the node's input, with the walk's synopsis
+    /// registry and the input's extensions.
+    pub fn synopsis_context<'a>(
+        &'a self,
+        input_stats: &'a Statistics,
+        input_schema: &'a Schema,
+    ) -> SynopsisContext<'a> {
+        let ctx = SynopsisContext::new_with_registry(
+            input_stats,
+            input_schema,
+            self.synopsis_registry(),
+        );
+        match &self.input_extensions {
+            Some(extensions) => {
+                ctx.with_extensions(&extensions.node, &extensions.columns)
+            }
+            None => ctx,
         }
     }
 }
@@ -343,6 +367,17 @@ impl StatisticsContext {
                 self.validate_child_requests(plan, &children, &requests)?;
                 let child_statistics =
                     self.resolve_children(plan, &children, &requests, args)?;
+                let with_input_extensions;
+                let args = match self.single_input_extensions(&children, &requests) {
+                    Some(extensions) => {
+                        with_input_extensions = StatisticsArgs {
+                            input_extensions: Some(Arc::new(extensions)),
+                            ..args.clone()
+                        };
+                        &with_input_extensions
+                    }
+                    None => args,
+                };
                 let statistics = plan.statistics_from_inputs(&child_statistics, args)?;
                 self.forward_column_extensions(plan, &children, &requests, partition);
                 statistics
@@ -477,6 +512,18 @@ impl StatisticsContext {
         Ok(None)
     }
 
+    /// The extensions stored for a node's single child, if any.
+    fn single_input_extensions(
+        &self,
+        children: &[&Arc<dyn ExecutionPlan>],
+        requests: &[ChildStats],
+    ) -> Option<NodeExtensions> {
+        let ([child], [ChildStats::At(child_partition)]) = (children, requests) else {
+            return None;
+        };
+        self.cached_extensions(child.as_ref(), *child_partition)
+    }
+
     /// Carries the child's column extensions through a built-in operator that
     /// moves values without changing them or the rows: a projection keeps them
     /// on each output column that is an input column, and a repartition (for
@@ -490,14 +537,11 @@ impl StatisticsContext {
         requests: &[ChildStats],
         partition: Option<usize>,
     ) {
-        let ([child], [ChildStats::At(child_partition)]) = (children, requests) else {
-            return;
-        };
-        let Some(child_extensions) =
-            self.cached_extensions(child.as_ref(), *child_partition)
+        let Some(child_extensions) = self.single_input_extensions(children, requests)
         else {
             return;
         };
+        let child = children[0];
         let columns: HashMap<usize, Extensions> =
             if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
                 let Ok(mapping) = projection
@@ -621,12 +665,15 @@ impl StatisticsContext {
 mod tests {
     use super::*;
     use crate::filter::FilterExec;
-    use crate::operator_statistics::StatisticsProvider;
+    use crate::operator_statistics::{
+        ExprSynopsis, StatisticsProvider, SynopsisProvider, SynopsisResult,
+    };
     use crate::test::exec::StatisticsExec;
     use crate::union::UnionExec;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::{ColumnStatistics, stats::Precision};
     use datafusion_expr::Operator;
+    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
 
     /// Overall-only provider: sets a fixed row count for any node.
@@ -867,6 +914,73 @@ mod tests {
             };
             Ok(StatisticsResult::Computed(first.clone()))
         }
+    }
+
+    #[derive(Debug)]
+    struct Marker;
+
+    /// Sets the row count of a leaf to 1000 and attaches a node-level `Marker`.
+    #[derive(Debug)]
+    struct MarkLeaf;
+    impl StatisticsProvider for MarkLeaf {
+        fn compute_statistics(
+            &self,
+            plan: &dyn ExecutionPlan,
+            child_stats: &[ExtendedStatistics],
+        ) -> Result<StatisticsResult> {
+            if !child_stats.is_empty() {
+                return Ok(StatisticsResult::Delegate);
+            }
+            let mut stats = Statistics::new_unknown(&plan.schema());
+            stats.num_rows = Precision::Exact(1000);
+            let mut extended = ExtendedStatistics::new(stats);
+            extended.set_extension(Marker);
+            Ok(StatisticsResult::Computed(extended))
+        }
+    }
+
+    /// Answers a predicate with selectivity 0.5 when the input carries a
+    /// `Marker`.
+    #[derive(Debug)]
+    struct HalfWhenMarked;
+    impl SynopsisProvider for HalfWhenMarked {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let is_predicate =
+                expr.data_type(ctx.args().input_schema()).ok() == Some(DataType::Boolean);
+            if !is_predicate || ctx.get_extension::<Marker>().is_none() {
+                return SynopsisResult::Delegate;
+            }
+            SynopsisResult::Computed(ExprSynopsis {
+                selectivity: Some(0.5),
+                ..ExprSynopsis::unknown(DataType::Boolean)
+            })
+        }
+    }
+
+    // A built-in `FilterExec` passes its input's extensions to the synopsis
+    // providers, so one that reads the leaf's `Marker` sets the selectivity.
+    #[test]
+    fn an_operator_passes_its_input_extensions_to_synopsis_providers() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(StatisticsExec::new(
+            Statistics::new_unknown(&schema),
+            schema.clone(),
+        ));
+        let predicate =
+            Arc::new(BinaryExpr::new(col("a", &schema)?, Operator::Gt, lit(0i32)));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, leaf)?);
+        let ctx = ctx_with(Arc::new(MarkLeaf)).with_synopsis_registry(
+            SynopsisRegistry::with_providers(vec![Arc::new(HalfWhenMarked)]),
+        );
+
+        let stats = ctx.compute(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(stats.num_rows, Precision::Inexact(500));
+        Ok(())
     }
 
     /// Attaches a `ColumnTag` to output column 1 of a leaf.
