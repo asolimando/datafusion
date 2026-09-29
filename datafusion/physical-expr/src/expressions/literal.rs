@@ -34,6 +34,7 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::placement::ExpressionPlacement;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
+use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
 /// Represents a literal value
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -93,6 +94,17 @@ impl std::fmt::Display for Literal {
 impl PhysicalExpr for Literal {
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
         Ok(self.value.data_type())
+    }
+
+    fn synopsis_from_inputs(
+        &self,
+        args: &SynopsisArgs,
+        _child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        Some(ExprSynopsis::literal(
+            self.value.clone(),
+            args.input_stats().num_rows,
+        ))
     }
 
     fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
@@ -186,7 +198,9 @@ mod tests {
     use super::*;
 
     use arrow::array::Int32Array;
+    use datafusion_common::Statistics;
     use datafusion_common::cast::as_int32_array;
+    use datafusion_common::stats::Precision;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     #[test]
@@ -225,6 +239,44 @@ mod tests {
         assert_eq!(sql_string, "42");
 
         Ok(())
+    }
+
+    #[test]
+    fn synopsis_from_inputs_is_a_single_distinct_value() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let stats = Statistics::new_unknown(&schema);
+        let args = SynopsisArgs::new(&stats, &schema);
+
+        let literal = Literal::new(ScalarValue::Int32(Some(7)));
+        let synopsis = literal
+            .synopsis_from_inputs(&args, &[])
+            .expect("a literal always has a synopsis");
+        assert_eq!(synopsis.column.distinct_count, Precision::Exact(1));
+        assert_eq!(
+            synopsis.column.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(7)))
+        );
+        assert_eq!(
+            synopsis.column.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(7)))
+        );
+        assert_eq!(synopsis.column.null_count, Precision::Exact(0));
+    }
+
+    #[test]
+    fn synopsis_from_inputs_null_literal_counts_every_row() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            ..Statistics::new_unknown(&schema)
+        };
+        let args = SynopsisArgs::new(&stats, &schema);
+
+        let literal = Literal::new(ScalarValue::Int32(None));
+        let synopsis = literal
+            .synopsis_from_inputs(&args, &[])
+            .expect("a literal always has a synopsis");
+        assert_eq!(synopsis.column.null_count, Precision::Exact(100));
     }
 }
 

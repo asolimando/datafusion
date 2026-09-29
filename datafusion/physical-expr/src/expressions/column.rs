@@ -30,6 +30,7 @@ use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::placement::ExpressionPlacement;
+use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
 /// Represents the column at a given index in a RecordBatch
 ///
@@ -109,6 +110,19 @@ impl PhysicalExpr for Column {
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
         self.bounds_check(input_schema)?;
         Ok(input_schema.field(self.index).data_type().clone())
+    }
+
+    fn synopsis_from_inputs(
+        &self,
+        args: &SynopsisArgs,
+        _child_synopses: &[ExprSynopsis],
+    ) -> Option<ExprSynopsis> {
+        let data_type = self.data_type(args.input_schema()).ok()?;
+        args.input_stats()
+            .column_statistics
+            .get(self.index)
+            .cloned()
+            .map(|column| ExprSynopsis::from_column(column, data_type))
     }
 
     /// Decide whether this expression is nullable, given the schema of the input
@@ -265,6 +279,9 @@ mod test {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion_common::Statistics;
+    use datafusion_common::stats::Precision;
+    use datafusion_physical_expr_common::synopsis::SynopsisArgs;
 
     use std::sync::Arc;
 
@@ -301,5 +318,38 @@ mod test {
              but input schema only has 1 columns: [\"foo\"].\nThis issue was likely caused by a bug \
              in DataFusion's code. Please help us to resolve this by filing a bug report \
              in our issue tracker: https://github.com/apache/datafusion/issues".starts_with(&error));
+    }
+
+    #[test]
+    fn synopsis_from_inputs_reads_its_own_column_statistics() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let mut column_statistics = Statistics::unknown_column(&schema);
+        column_statistics[1].distinct_count = Precision::Exact(7);
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        };
+        let args = SynopsisArgs::new(&stats, &schema);
+
+        let b = Column::new("b", 1);
+        let synopsis = b
+            .synopsis_from_inputs(&args, &[])
+            .expect("a Column's synopsis comes from the input statistics");
+        assert_eq!(synopsis.data_type, DataType::Utf8);
+        assert_eq!(synopsis.column.distinct_count, Precision::Exact(7));
+    }
+
+    #[test]
+    fn synopsis_from_inputs_out_of_bounds_is_none() {
+        let schema = Schema::new(vec![Field::new("foo", DataType::Utf8, true)]);
+        let stats = Statistics::new_unknown(&schema);
+        let args = SynopsisArgs::new(&stats, &schema);
+
+        let col = Column::new("id", 9);
+        assert!(col.synopsis_from_inputs(&args, &[]).is_none());
     }
 }
