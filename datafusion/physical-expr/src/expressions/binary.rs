@@ -611,6 +611,25 @@ impl PhysicalExpr for BinaryExpr {
                     ..ExprSynopsis::unknown(output_type)
                 })
             }
+            // Conjunction selectivity under the independence assumption: the
+            // fraction of rows that pass both predicates is the product of the
+            // fractions that pass each one. When only one side's selectivity is
+            // known, the unknown side contributes the caller's default
+            // selectivity, or nothing when the caller sets none.
+            Operator::And => {
+                let selectivity = match (left.selectivity, right.selectivity) {
+                    (Some(l), Some(r)) => l * r,
+                    (Some(known), None) | (None, Some(known)) => {
+                        known * args.default_selectivity().unwrap_or(1.0)
+                    }
+                    (None, None) => return None,
+                };
+                let output_type = self.data_type(input_schema).ok()?;
+                Some(ExprSynopsis {
+                    selectivity: Some(selectivity),
+                    ..ExprSynopsis::unknown(output_type)
+                })
+            }
             _ => None,
         }
     }

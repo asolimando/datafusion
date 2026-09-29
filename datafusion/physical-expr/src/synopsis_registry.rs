@@ -177,6 +177,13 @@ impl<'a> SynopsisContext<'a> {
         }
     }
 
+    /// Returns this context with the caller's default selectivity, which a rule
+    /// may use for a predicate that nothing estimates.
+    pub fn with_default_selectivity(mut self, default_selectivity: f64) -> Self {
+        self.args = self.args.with_default_selectivity(default_selectivity);
+        self
+    }
+
     /// The arguments every expression in this walk is computed against, the
     /// same ones the built-in rules see.
     pub fn args(&self) -> &SynopsisArgs<'a> {
@@ -386,7 +393,7 @@ fn conform(mut synopsis: ExprSynopsis, data_type: &DataType) -> Option<ExprSynop
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{BinaryExpr, Column, lit};
+    use crate::expressions::{BinaryExpr, Column, LikeExpr, lit};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, ScalarValue};
@@ -865,6 +872,153 @@ mod tests {
                 .unwrap();
         let analysis = analyze(&p_size_gt_40, input, &schema).unwrap();
         assert_eq!(Some(selectivity), analysis.selectivity);
+    }
+
+    // `p_size > 40 AND p_type LIKE '%BRASS%'`: interval analysis rejects the
+    // whole predicate, because `LIKE` is not supported, but supports the
+    // `p_size > 40` conjunct, which gets 0.2 from it. `LIKE` has no built-in
+    // rule, so the conjunction keeps the supported conjunct's selectivity,
+    // combined with the caller's default selectivity when there is one.
+    #[test]
+    fn and_combines_its_known_conjunct_with_the_default() {
+        let (stats, schema) = part_stats();
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let p_size_gt_40: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p_size", 0)),
+            Operator::Gt,
+            lit(40_i32),
+        ));
+        let p_type_like: Arc<dyn PhysicalExpr> = Arc::new(LikeExpr::new(
+            false,
+            false,
+            Arc::new(Column::new("p_type", 1)),
+            lit("%BRASS%"),
+        ));
+        assert!(
+            ctx.compute(&p_type_like)
+                .and_then(|s| s.selectivity)
+                .is_none(),
+            "LIKE has no selectivity of its own"
+        );
+        let and: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(p_size_gt_40, Operator::And, p_type_like));
+        let selectivity = ctx
+            .compute(&and)
+            .and_then(|s| s.selectivity)
+            .expect("the conjunction has a synopsis");
+        assert!(
+            (selectivity - 0.2).abs() < 1e-9,
+            "the conjunction keeps the 0.2 of `p_size > 40`, got {selectivity}"
+        );
+
+        // With a default selectivity, the unknown conjunct contributes it.
+        let ctx = SynopsisContext::new(&stats, &schema).with_default_selectivity(0.5);
+        let selectivity = ctx
+            .compute(&and)
+            .and_then(|s| s.selectivity)
+            .expect("the conjunction has a synopsis");
+        assert!(
+            (selectivity - 0.1).abs() < 1e-9,
+            "0.2 for `p_size > 40` times the default 0.5, got {selectivity}"
+        );
+    }
+
+    /// Matches a comparison of the given column with the given operator, so a
+    /// test can answer for one conjunct without answering the other.
+    #[derive(Debug)]
+    struct OverrideComparison {
+        column: &'static str,
+        op: Operator,
+        selectivity: f64,
+    }
+    impl SynopsisProvider for OverrideComparison {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+                return SynopsisResult::Delegate;
+            };
+            if *binary.op() != self.op {
+                return SynopsisResult::Delegate;
+            }
+            let Some(col) = binary.left().downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            if col.name() != self.column {
+                return SynopsisResult::Delegate;
+            }
+            SynopsisResult::Computed(ExprSynopsis {
+                selectivity: Some(self.selectivity),
+                ..ExprSynopsis::unknown(DataType::Boolean)
+            })
+        }
+    }
+
+    // `p_size > 40 AND p_size < 45`: without a provider, one `analyze()`
+    // call over the whole conjunction gives its selectivity. With a provider
+    // that answers only the left conjunct, the `AND` combines the provider's
+    // answer with the right conjunct's own selectivity from interval
+    // analysis.
+    #[test]
+    fn provider_on_one_conjunct_is_not_overridden_by_whole_subtree_analysis() {
+        let (stats, schema) = part_stats();
+        let p_size_gt_40: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p_size", 0)),
+            Operator::Gt,
+            lit(40_i32),
+        ));
+        let p_size_lt_45: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p_size", 0)),
+            Operator::Lt,
+            lit(45_i32),
+        ));
+        let and: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&p_size_gt_40),
+            Operator::And,
+            Arc::clone(&p_size_lt_45),
+        ));
+
+        let no_provider_ctx = SynopsisContext::new(&stats, &schema);
+        let whole_subtree_selectivity = no_provider_ctx
+            .compute(&and)
+            .and_then(|s| s.selectivity)
+            .expect("the AND is computed from one analyze() call over both conjuncts");
+
+        let overridden_selectivity = 0.9;
+        assert!(
+            (overridden_selectivity - whole_subtree_selectivity).abs() > 1e-9,
+            "the override must differ from the whole-subtree answer for this \
+             test to be meaningful"
+        );
+        let registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(OverrideComparison {
+                column: "p_size",
+                op: Operator::Gt,
+                selectivity: overridden_selectivity,
+            })]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+        let right_selectivity = ctx
+            .compute(&p_size_lt_45)
+            .and_then(|s| s.selectivity)
+            .expect("the right conjunct is computed through its own single analyze()");
+        let and_selectivity = ctx
+            .compute(&and)
+            .and_then(|s| s.selectivity)
+            .expect("the AND has a synopsis");
+
+        assert_ne!(
+            and_selectivity, whole_subtree_selectivity,
+            "the provider's answer changes the AND's selectivity away from \
+             the whole-subtree analyze() answer"
+        );
+        assert!(
+            (and_selectivity - overridden_selectivity * right_selectivity).abs() < 1e-9,
+            "the AND combines the provider's answer for the left conjunct \
+             with the right conjunct's own selectivity, got {and_selectivity}"
+        );
     }
 
     // A column with no min or max gives interval analysis nothing to narrow,

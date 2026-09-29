@@ -106,6 +106,7 @@ impl ExprSynopsis {
 pub struct SynopsisArgs<'a> {
     input_stats: &'a Statistics,
     input_schema: &'a Schema,
+    default_selectivity: Option<f64>,
 }
 
 impl<'a> SynopsisArgs<'a> {
@@ -114,7 +115,21 @@ impl<'a> SynopsisArgs<'a> {
         Self {
             input_stats,
             input_schema,
+            default_selectivity: None,
         }
+    }
+
+    /// Returns these arguments with the caller's default selectivity: the
+    /// fraction of rows a predicate is assumed to keep when nothing estimates
+    /// it.
+    pub fn with_default_selectivity(mut self, default_selectivity: f64) -> Self {
+        self.default_selectivity = Some(default_selectivity);
+        self
+    }
+
+    /// The caller's default selectivity, if it set one.
+    pub fn default_selectivity(&self) -> Option<f64> {
+        self.default_selectivity
     }
 
     /// The relation-level statistics of the expression's input.
