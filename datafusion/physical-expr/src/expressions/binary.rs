@@ -669,6 +669,40 @@ impl PhysicalExpr for BinaryExpr {
                     ..ExprSynopsis::unknown(output_type)
                 })
             }
+            // Multiplying by a constant is injective only when the constant is
+            // not zero, so the constant must be known, not NULL, and different
+            // from zero.
+            // The count is never `Exact`: wrapping integer multiplication by
+            // an even constant can map two distinct inputs onto one result (in
+            // `u8`, `1 * 2` and `129 * 2` are both 2), and floating point
+            // multiplication rounds.
+            Operator::Multiply => {
+                let (constant, other) =
+                    match (is_exact_constant(left), is_exact_constant(right)) {
+                        (true, false) => (left, right),
+                        (false, true) => (right, left),
+                        _ => return None,
+                    };
+                let min = constant.column.min_value.get_value()?;
+                let max = constant.column.max_value.get_value()?;
+                if min != max {
+                    return None;
+                }
+                let zero = ScalarValue::new_zero(&constant.data_type).ok()?;
+                if *min == zero {
+                    return None;
+                }
+                let output_type = self.data_type(input_schema).ok()?;
+                let column = ColumnStatistics {
+                    distinct_count: other.column.distinct_count.to_inexact(),
+                    null_count: null_count_beside_constant(left, right),
+                    ..ColumnStatistics::new_unknown()
+                };
+                Some(ExprSynopsis {
+                    column,
+                    ..ExprSynopsis::unknown(output_type)
+                })
+            }
             // Equality selectivity under the uniform-distribution assumption:
             // with `ndv` distinct values spread evenly, one value matches a
             // `1 / ndv` fraction of the rows.

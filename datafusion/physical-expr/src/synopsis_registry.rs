@@ -1334,6 +1334,47 @@ mod tests {
         );
     }
 
+    // Multiplying by a non-zero constant carries the other operand's distinct
+    // count over as `Inexact`. Multiplying by zero maps every value onto one,
+    // so no distinct count rule applies.
+    #[test]
+    fn multiply_by_constant_ndv_rule() {
+        let (stats, schema) = one_col_stats(9, DataType::Int64);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("col0", 0));
+
+        let mul: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Multiply,
+            lit(2_i64),
+        ));
+        assert_eq!(
+            ctx.compute(&mul).map(|s| s.column.distinct_count),
+            Some(Precision::Inexact(9)),
+            "a non-zero constant carries the count over as Inexact"
+        );
+
+        let mul_null: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&a),
+            Operator::Multiply,
+            lit(ScalarValue::Int64(None)),
+        ));
+        assert_eq!(
+            ctx.compute(&mul_null).map(|s| s.column.distinct_count),
+            Some(Precision::Absent),
+            "a NULL constant makes every result NULL, so no distinct count rule \
+             applies"
+        );
+
+        let mul_zero: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a, Operator::Multiply, lit(0_i64)));
+        assert_eq!(
+            ctx.compute(&mul_zero).map(|s| s.column.distinct_count),
+            Some(Precision::Inexact(1)),
+            "a zero constant maps every value onto zero, a single value"
+        );
+    }
+
     /// A test-local stand-in for cross-column correlation metadata the input
     /// might carry: two columns tend to satisfy their comparisons together
     /// more often (or less often) than independence would predict.
