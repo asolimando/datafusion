@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::Statistics;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
@@ -179,9 +179,14 @@ impl<'a> SynopsisContext<'a> {
         // receives `None` instead of recursing indefinitely.
         self.cache.borrow_mut().insert(Arc::clone(expr), None);
 
-        let mut result = self.provider_answer(expr);
+        // This fails only if the context was created with the wrong schema.
+        let Ok(data_type) = expr.data_type(self.args.input_schema()) else {
+            return None;
+        };
+
+        let mut result = self.provider_answer(expr, &data_type);
         if result.is_none() {
-            result = self.compute_from_children(expr);
+            result = self.compute_from_children(expr, &data_type);
         }
 
         self.cache
@@ -190,10 +195,22 @@ impl<'a> SynopsisContext<'a> {
         result
     }
 
-    fn provider_answer(&self, expr: &Arc<dyn PhysicalExpr>) -> Option<ExprSynopsis> {
+    fn provider_answer(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        data_type: &DataType,
+    ) -> Option<ExprSynopsis> {
         self.registry.providers.iter().find_map(|p| {
             match p.compute_synopsis(expr, self) {
-                SynopsisResult::Computed(synopsis) => Some(synopsis),
+                SynopsisResult::Computed(synopsis) => {
+                    let conformed = conform(synopsis, data_type);
+                    if conformed.is_none() {
+                        log::debug!(
+                            "ignoring {p:?}: selectivity on non-Boolean expression {expr}"
+                        );
+                    }
+                    conformed
+                }
                 SynopsisResult::Delegate => None,
             }
         })
@@ -204,6 +221,7 @@ impl<'a> SynopsisContext<'a> {
     fn compute_from_children(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
+        data_type: &DataType,
     ) -> Option<ExprSynopsis> {
         let children = expr.children();
         let child_synopses: Vec<Option<ExprSynopsis>> =
@@ -224,8 +242,20 @@ impl<'a> SynopsisContext<'a> {
                     .map(ExprSynopsis::unknown),
             })
             .collect();
-        computed.and_then(|computed| expr.synopsis_from_inputs(&self.args, &computed))
+        computed.and_then(|computed| {
+            expr.synopsis_from_inputs(&self.args, &computed)
+                .and_then(|s| conform(s, data_type))
+        })
     }
+}
+
+/// Sets the synopsis type from the schema, whatever the provider or rule
+/// declared, and rejects a selectivity on a non-Boolean expression, where it
+/// has no meaning.
+fn conform(mut synopsis: ExprSynopsis, data_type: &DataType) -> Option<ExprSynopsis> {
+    synopsis.data_type = data_type.clone();
+    (synopsis.selectivity.is_none() || *data_type == DataType::Boolean)
+        .then_some(synopsis)
 }
 
 #[cfg(test)]
@@ -367,6 +397,88 @@ mod tests {
 
         let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
         assert_eq!(ctx.compute(&a).and_then(|s| s.ndv()), Some(42));
+    }
+
+    /// Supplies correct statistics with the wrong data type.
+    #[derive(Debug)]
+    struct MislabelledColumn;
+
+    impl SynopsisProvider for MislabelledColumn {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(_) = expr.downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            SynopsisResult::Computed(ExprSynopsis::from_column(
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(7),
+                    ..ColumnStatistics::new_unknown()
+                },
+                DataType::Utf8,
+            ))
+        }
+    }
+
+    #[test]
+    fn synopsis_type_follows_the_input_schema() {
+        let (stats, schema) = one_col_stats(42, DataType::Float64);
+        let registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(MislabelledColumn)]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let synopsis = ctx.compute(&a).expect("the provider supplies a synopsis");
+        assert_eq!(synopsis.data_type, DataType::Float64);
+        assert_eq!(
+            synopsis.ndv(),
+            Some(7),
+            "the provider's statistics are kept"
+        );
+    }
+
+    /// Sets a selectivity on any column and declares the synopsis Boolean.
+    #[derive(Debug)]
+    struct SelectivityOnAnyColumn;
+
+    impl SynopsisProvider for SelectivityOnAnyColumn {
+        fn compute_synopsis(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            _ctx: &SynopsisContext,
+        ) -> SynopsisResult {
+            let Some(_) = expr.downcast_ref::<Column>() else {
+                return SynopsisResult::Delegate;
+            };
+            SynopsisResult::Computed(ExprSynopsis {
+                selectivity: Some(0.5),
+                ..ExprSynopsis::unknown(DataType::Boolean)
+            })
+        }
+    }
+
+    #[test]
+    fn selectivity_on_non_boolean_expression_is_rejected() {
+        let (stats, schema) = one_col_stats(42, DataType::Float64);
+        let registry =
+            SynopsisRegistry::with_providers(vec![Arc::new(SelectivityOnAnyColumn)]);
+        let ctx = SynopsisContext::new_with_registry(&stats, &schema, &registry);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let synopsis = ctx
+            .compute(&a)
+            .expect("the built-in rule computes the column");
+        assert_eq!(
+            synopsis.selectivity, None,
+            "the provider's synopsis is rejected"
+        );
+        assert_eq!(
+            synopsis.ndv(),
+            Some(42),
+            "the built-in column lookup supplies the synopsis instead"
+        );
     }
 
     #[test]
