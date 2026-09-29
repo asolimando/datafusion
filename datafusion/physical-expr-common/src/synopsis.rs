@@ -22,10 +22,14 @@
 //! [`ColumnStatistics`] and adds the field that `ColumnStatistics` has no
 //! place for: the `selectivity` of a Boolean predicate.
 
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType, Schema};
 use datafusion_common::extensions::Extensions;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+
+use crate::physical_expr::PhysicalExpr;
 
 /// Statistics estimate for the output values of one expression.
 ///
@@ -96,7 +100,8 @@ impl ExprSynopsis {
 }
 
 /// Per-call input to [`PhysicalExpr::synopsis_from_inputs`]: the
-/// relation-level statistics and the schema of the expression's input.
+/// relation-level statistics and the schema of the expression's input, and
+/// optionally a condition that the input rows satisfy.
 ///
 /// The fields are private so that a new call parameter can be added without
 /// changing the trait method's signature.
@@ -106,6 +111,7 @@ impl ExprSynopsis {
 pub struct SynopsisArgs<'a> {
     input_stats: &'a Statistics,
     input_schema: &'a Schema,
+    condition: Option<&'a Arc<dyn PhysicalExpr>>,
     default_selectivity: Option<f64>,
 }
 
@@ -115,6 +121,7 @@ impl<'a> SynopsisArgs<'a> {
         Self {
             input_stats,
             input_schema,
+            condition: None,
             default_selectivity: None,
         }
     }
@@ -130,6 +137,20 @@ impl<'a> SynopsisArgs<'a> {
     /// The caller's default selectivity, if it set one.
     pub fn default_selectivity(&self) -> Option<f64> {
         self.default_selectivity
+    }
+
+    /// Returns these arguments with `condition` set: the synopsis describes
+    /// only the input rows for which `condition` holds.
+    pub fn with_condition(mut self, condition: &'a Arc<dyn PhysicalExpr>) -> Self {
+        self.condition = Some(condition);
+        self
+    }
+
+    /// The predicate that the input rows satisfy, or `None` when the synopsis
+    /// describes all input rows. The input statistics are not narrowed by the
+    /// condition. A rule that does not use the condition ignores it.
+    pub fn condition(&self) -> Option<&'a Arc<dyn PhysicalExpr>> {
+        self.condition
     }
 
     /// The relation-level statistics of the expression's input.

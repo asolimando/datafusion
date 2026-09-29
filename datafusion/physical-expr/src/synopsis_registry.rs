@@ -34,17 +34,24 @@
 //! over the built-in rules.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
-use datafusion_common::Statistics;
+use datafusion_common::stats::Precision;
+use datafusion_common::{ColumnStatistics, Statistics};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::synopsis::{ExprSynopsis, SynopsisArgs};
 
+use crate::expressions::Column;
+use crate::filter_statistics::{
+    collect_equality_columns, collect_null_rejecting_columns,
+    column_statistics_from_boundaries, column_statistics_from_selectivity,
+    distinct_count_after_filter,
+};
 use crate::intervals::utils::check_support;
-use crate::{AnalysisContext, analyze};
+use crate::{AnalysisContext, ExprBoundaries, analyze};
 
 /// Result of attempting to compute a synopsis with a [`SynopsisProvider`],
 /// the expression-level counterpart of `StatisticsResult`.
@@ -124,10 +131,12 @@ static EMPTY: SynopsisRegistry = SynopsisRegistry {
 /// nothing computed it.
 type CacheEntry = Option<ExprSynopsis>;
 
-/// The `analyze()` outcome for one expression.
+/// The `analyze()` outcome for one expression: its selectivity and the
+/// interval-analysis boundaries of every input column under it.
 #[derive(Debug)]
 struct AnalyzeResult {
     selectivity: Option<f64>,
+    boundaries: Vec<ExprBoundaries>,
 }
 
 /// The `analyze()` outcome per expression, `None` when there is none.
@@ -151,6 +160,87 @@ pub struct SynopsisContext<'a> {
     /// every descendant) contains no provider answer.
     provider_free_cache: RefCell<HashMap<Arc<dyn PhysicalExpr>, bool>>,
     analysis_cache: RefCell<AnalysisCache>,
+    /// The precomputed facts about the condition in [`Self::args`], when the
+    /// context was derived with [`Self::given`].
+    condition_estimate: Option<ConditionEstimate>,
+}
+/// The facts about a condition that every column computed under it reuses,
+/// computed once when a context is derived with [`SynopsisContext::given`].
+#[derive(Debug)]
+struct ConditionEstimate {
+    /// The fraction of input rows that satisfy the condition.
+    selectivity: f64,
+    /// The input row count scaled by `selectivity`.
+    filtered_num_rows: Precision<usize>,
+    /// The interval-analysis boundaries of every input column under the
+    /// condition, or `None` when `check_support` rejects the condition or the
+    /// analysis fails.
+    boundaries: Option<Vec<ExprBoundaries>>,
+    /// The columns that the condition equates to one non-null literal.
+    equality_columns: HashSet<usize>,
+    /// The columns that cannot be NULL in a row that satisfies the condition.
+    null_rejecting_columns: HashSet<usize>,
+}
+
+impl ConditionEstimate {
+    /// `boundaries` is the interval-analysis boundaries of every input
+    /// column under `condition`, precomputed by the caller (normally reused
+    /// from the context's `analyze()` cache), or `None` when `check_support`
+    /// rejects `condition` or `analyze()` failed.
+    fn new(
+        args: &SynopsisArgs,
+        condition: &Arc<dyn PhysicalExpr>,
+        selectivity: f64,
+        boundaries: Option<Vec<ExprBoundaries>>,
+    ) -> Self {
+        let input_stats = args.input_stats();
+        let (equality_columns, _) = collect_equality_columns(condition);
+        Self {
+            selectivity,
+            filtered_num_rows: input_stats
+                .num_rows
+                .with_estimated_selectivity(selectivity),
+            boundaries,
+            equality_columns,
+            null_rejecting_columns: collect_null_rejecting_columns(condition),
+        }
+    }
+
+    /// The statistics of the input column at `index`, restricted to the rows
+    /// that satisfy the condition.
+    fn column_statistics(
+        &self,
+        index: usize,
+        args: &SynopsisArgs,
+    ) -> Option<ColumnStatistics> {
+        let input_stats = args.input_stats();
+        let input = input_stats.column_statistics.get(index)?;
+        let data_type = args.input_schema().fields().get(index)?.data_type();
+        let null_rejecting = self.null_rejecting_columns.contains(&index);
+        let mut column = match &self.boundaries {
+            Some(boundaries) => column_statistics_from_boundaries(
+                data_type,
+                input,
+                boundaries.get(index)?.clone(),
+                self.selectivity,
+                null_rejecting,
+                self.filtered_num_rows,
+            ),
+            None => column_statistics_from_selectivity(
+                input,
+                self.selectivity,
+                null_rejecting,
+                self.equality_columns.contains(&index),
+                self.filtered_num_rows,
+            ),
+        };
+        column.distinct_count = distinct_count_after_filter(
+            column.distinct_count,
+            input_stats.num_rows,
+            self.filtered_num_rows,
+        );
+        Some(column)
+    }
 }
 
 impl<'a> SynopsisContext<'a> {
@@ -174,6 +264,40 @@ impl<'a> SynopsisContext<'a> {
             provider_cache: RefCell::new(HashMap::new()),
             provider_free_cache: RefCell::new(HashMap::new()),
             analysis_cache: RefCell::new(HashMap::new()),
+            condition_estimate: None,
+        }
+    }
+    /// Derives a context that computes expressions over only the input rows
+    /// that satisfy `condition`, with its own cache. Providers see `condition`
+    /// through [`SynopsisArgs::condition`]. A condition already set on this
+    /// context is replaced, not combined.
+    ///
+    /// `selectivity` is the fraction of rows that satisfy `condition`; the
+    /// caller passes the value it uses for its row count, so the column
+    /// statistics agree with it. Interval analysis of `condition` runs once and
+    /// serves every column.
+    pub fn given<'b>(
+        &'b self,
+        condition: &'b Arc<dyn PhysicalExpr>,
+        selectivity: f64,
+    ) -> SynopsisContext<'b> {
+        let args = self.args.with_condition(condition);
+        let boundaries = self
+            .analyze_once(condition)
+            .map(|analysis| analysis.boundaries.clone());
+        SynopsisContext {
+            args,
+            registry: self.registry,
+            cache: RefCell::new(HashMap::new()),
+            provider_cache: RefCell::new(HashMap::new()),
+            provider_free_cache: RefCell::new(HashMap::new()),
+            analysis_cache: RefCell::new(HashMap::new()),
+            condition_estimate: Some(ConditionEstimate::new(
+                &args,
+                condition,
+                selectivity,
+                boundaries,
+            )),
         }
     }
 
@@ -307,6 +431,9 @@ impl<'a> SynopsisContext<'a> {
         } else {
             ExprSynopsis::unknown(data_type.clone())
         };
+        if let Some(column) = self.conditioned_column(expr, data_type) {
+            synopsis = column;
+        }
         synopsis.selectivity = Some(selectivity);
         Some(synopsis)
     }
@@ -340,10 +467,15 @@ impl<'a> SynopsisContext<'a> {
                     .map(ExprSynopsis::unknown),
             })
             .collect();
-        computed.and_then(|computed| {
+        let mut synopsis = computed.and_then(|computed| {
             expr.synopsis_from_inputs(&self.args, &computed)
                 .and_then(|s| conform(s, data_type))
-        })
+        });
+
+        if let Some(column) = self.conditioned_column(expr, data_type) {
+            synopsis = Some(column);
+        }
+        synopsis
     }
 
     /// Runs `analyze()` on `expr`'s own subtree and caches the outcome, so
@@ -369,6 +501,7 @@ impl<'a> SynopsisContext<'a> {
             .map(|analysis| {
                 Arc::new(AnalyzeResult {
                     selectivity: analysis.selectivity,
+                    boundaries: analysis.boundaries,
                 })
             })
         } else {
@@ -378,6 +511,20 @@ impl<'a> SynopsisContext<'a> {
             .borrow_mut()
             .insert(Arc::clone(expr), result.clone());
         result
+    }
+
+    /// The built-in synopsis of a `Column` under the condition of this
+    /// context, or `None` when `expr` is not a `Column` or the context has no
+    /// condition.
+    fn conditioned_column(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        data_type: &DataType,
+    ) -> Option<ExprSynopsis> {
+        let estimate = self.condition_estimate.as_ref()?;
+        let column = expr.downcast_ref::<Column>()?;
+        let statistics = estimate.column_statistics(column.index(), &self.args)?;
+        Some(ExprSynopsis::from_column(statistics, data_type.clone()))
     }
 }
 
@@ -922,6 +1069,70 @@ mod tests {
             (selectivity - 0.1).abs() < 1e-9,
             "0.2 for `p_size > 40` times the default 0.5, got {selectivity}"
         );
+    }
+
+    // Given `a = 5`, interval analysis narrows `a` to the single value 5, so
+    // its conditioned synopsis has a minimum and maximum of 5 and one distinct
+    // value. The same column computed without the condition keeps its input
+    // statistics, because the conditioned results are cached apart. `b`,
+    // which the condition does not constrain, keeps its range as `Inexact`,
+    // and its distinct count of 800 is capped at the 20 rows that satisfy the
+    // condition (1000 rows * 1 / 50) and then reduced to 13 for the values
+    // whose rows the filter removes.
+    #[test]
+    fn column_under_condition_is_narrowed_by_interval_analysis() {
+        let int = |v: i32| ScalarValue::Int32(Some(v));
+        let stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(50),
+                    min_value: Precision::Exact(int(0)),
+                    max_value: Precision::Exact(int(99)),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(800),
+                    min_value: Precision::Exact(int(0)),
+                    max_value: Precision::Exact(int(999)),
+                    ..ColumnStatistics::new_unknown()
+                },
+            ],
+        };
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let a_eq_5: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Eq, lit(5_i32)));
+        let selectivity = ctx
+            .compute(&a_eq_5)
+            .and_then(|s| s.selectivity)
+            .expect("the predicate has a synopsis");
+
+        let filtered = ctx.given(&a_eq_5, selectivity);
+        assert!(filtered.args().condition().is_some());
+        assert!(ctx.args().condition().is_none());
+
+        let a_given = filtered.compute(&a).expect("a has a synopsis").column;
+        assert_eq!(a_given.min_value, Precision::Exact(int(5)));
+        assert_eq!(a_given.max_value, Precision::Exact(int(5)));
+        assert_eq!(a_given.distinct_count, Precision::Exact(1));
+        assert_eq!(
+            ctx.compute(&a).expect("a has a synopsis").column.min_value,
+            Precision::Exact(int(0)),
+            "without the condition, `a` keeps its input minimum"
+        );
+
+        let b_given = filtered.compute(&b).expect("b has a synopsis").column;
+        assert_eq!(b_given.min_value, Precision::Inexact(int(0)));
+        assert_eq!(b_given.max_value, Precision::Inexact(int(999)));
+        assert_eq!(b_given.distinct_count, Precision::Inexact(13));
     }
 
     /// Matches a comparison of the given column with the given operator, so a

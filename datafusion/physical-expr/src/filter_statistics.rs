@@ -227,6 +227,34 @@ pub fn ndv_after_selectivity(
     (expected_ndv.round() as usize).clamp(1, original_ndv)
 }
 
+/// Applies [`ndv_after_selectivity`] to a distinct count that is already
+/// capped at the filtered row count, with the selectivity taken as the ratio
+/// of the filtered row count to the input row count. A value can appear on
+/// several rows, and the filter can remove all of them, so fewer distinct
+/// values survive than the cap allows.
+///
+/// The count is returned unchanged when it is 1 or less (the formula gives
+/// the same count), when a row count is unknown, when the input row count is
+/// zero, and when the filter keeps every row.
+pub(crate) fn distinct_count_after_filter(
+    distinct_count: Precision<usize>,
+    input_num_rows: Precision<usize>,
+    filtered_num_rows: Precision<usize>,
+) -> Precision<usize> {
+    let (Some(&ndv), Some(&input_rows), Some(&filtered_rows)) = (
+        distinct_count.get_value(),
+        input_num_rows.get_value(),
+        filtered_num_rows.get_value(),
+    ) else {
+        return distinct_count;
+    };
+    if ndv <= 1 || input_rows == 0 || filtered_rows >= input_rows {
+        return distinct_count;
+    }
+    let selectivity = filtered_rows as f64 / input_rows as f64;
+    Precision::Inexact(ndv_after_selectivity(ndv, input_rows, selectivity))
+}
+
 /// Builds one column's statistics after a filter, from that column's
 /// interval-analysis boundaries.
 ///
