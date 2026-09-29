@@ -74,6 +74,7 @@ use datafusion_optimizer::{
     Analyzer, AnalyzerRule, Optimizer, OptimizerConfig, OptimizerRule,
 };
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::ExecutionPlan;
@@ -228,6 +229,9 @@ struct SessionStateInner {
     /// enhanced statistics (e.g., NDV overrides, histograms) beyond what
     /// is available from `ExecutionPlan::partition_statistics()`.
     statistics_registry: Option<StatisticsRegistry>,
+    /// Expression-level statistics providers, consulted before the built-in
+    /// `PhysicalExpr::synopsis_from_inputs` rules.
+    synopsis_registry: Option<SynopsisRegistry>,
     /// Cache logical plans of prepared statements for later execution.
     /// Key is the prepared statement name.
     prepared_plans: HashMap<String, Arc<PreparedPlan>>,
@@ -240,6 +244,10 @@ impl PhysicalOptimizerContext for SessionState {
 
     fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
         self.statistics_registry()
+    }
+
+    fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
+        self.synopsis_registry()
     }
 }
 
@@ -314,6 +322,10 @@ impl Session for SessionState {
 
     fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
         SessionState::statistics_registry(self)
+    }
+
+    fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
+        SessionState::synopsis_registry(self)
     }
 
     // Hand-written `#[async_trait]` expansion to reduce compile time. See
@@ -959,6 +971,11 @@ impl SessionState {
         self.inner.statistics_registry.as_ref()
     }
 
+    /// Returns the synopsis registry if one is configured.
+    pub fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
+        self.inner.synopsis_registry.as_ref()
+    }
+
     /// Mark the start of the execution
     pub fn mark_start_execution(&mut self) {
         let config = Arc::clone(self.config().options());
@@ -1164,6 +1181,7 @@ pub struct SessionStateBuilder {
     function_factory: Option<Arc<dyn FunctionFactory>>,
     cache_factory: Option<Arc<dyn CacheFactory>>,
     statistics_registry: Option<StatisticsRegistry>,
+    synopsis_registry: Option<SynopsisRegistry>,
     // fields to support convenience functions
     analyzer_rules: Option<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>,
     optimizer_rules: Option<Vec<Arc<dyn OptimizerRule + Send + Sync>>>,
@@ -1208,6 +1226,7 @@ impl SessionStateBuilder {
             function_factory: None,
             cache_factory: None,
             statistics_registry: None,
+            synopsis_registry: None,
             // fields to support convenience functions
             analyzer_rules: None,
             optimizer_rules: None,
@@ -1274,6 +1293,7 @@ impl SessionStateBuilder {
             function_factory: existing.function_factory,
             cache_factory: existing.cache_factory,
             statistics_registry: existing.statistics_registry,
+            synopsis_registry: existing.synopsis_registry,
             // fields to support convenience functions
             analyzer_rules: None,
             optimizer_rules: None,
@@ -1639,6 +1659,13 @@ impl SessionStateBuilder {
         self
     }
 
+    /// Set the [`SynopsisRegistry`] whose providers are consulted before the
+    /// built-in expression rules.
+    pub fn with_synopsis_registry(mut self, registry: SynopsisRegistry) -> Self {
+        self.synopsis_registry = Some(registry);
+        self
+    }
+
     /// Register an `ObjectStore` to the [`RuntimeEnv`]. See [`RuntimeEnv::register_object_store`]
     /// for more details.
     ///
@@ -1709,6 +1736,7 @@ impl SessionStateBuilder {
             function_factory,
             cache_factory,
             statistics_registry,
+            synopsis_registry,
             analyzer_rules,
             optimizer_rules,
             physical_optimizer_rules,
@@ -1751,6 +1779,7 @@ impl SessionStateBuilder {
             function_factory,
             cache_factory,
             statistics_registry,
+            synopsis_registry,
             prepared_plans: HashMap::new(),
         });
 

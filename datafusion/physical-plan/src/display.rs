@@ -28,6 +28,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::display::GraphvizBuilder;
 use datafusion_expr::display_schema;
 use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 
 use crate::metrics::{MetricCategory, MetricType, MetricValue};
 use crate::render_tree::RenderTree;
@@ -124,6 +125,7 @@ pub struct DisplayableExecutionPlan<'a> {
     /// If statistics should be displayed
     show_statistics: bool,
     registry: StatisticsRegistry,
+    synopsis_registry: SynopsisRegistry,
     /// If schema should be displayed. See [`Self::set_show_schema`]
     show_schema: bool,
     /// Which metric categories should be included when rendering
@@ -181,6 +183,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
         Self {
             inner,
             registry: StatisticsRegistry::new(),
+            synopsis_registry: SynopsisRegistry::new(),
             show_metrics,
             show_statistics: false,
             show_schema: false,
@@ -210,6 +213,12 @@ impl<'a> DisplayableExecutionPlan<'a> {
     /// Set the [`StatisticsRegistry`] consulted when computing displayed statistics.
     pub fn set_statistics_registry(mut self, registry: StatisticsRegistry) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Set the [`SynopsisRegistry`] consulted when computing displayed statistics.
+    pub fn set_synopsis_registry(mut self, synopsis_registry: SynopsisRegistry) -> Self {
+        self.synopsis_registry = synopsis_registry;
         self
     }
 
@@ -291,6 +300,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics,
             show_statistics: bool,
             registry: StatisticsRegistry,
+            synopsis_registry: SynopsisRegistry,
             show_schema: bool,
             metric_types: Vec<MetricType>,
             metric_categories: Option<Vec<MetricCategory>>,
@@ -305,6 +315,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     show_metrics: self.show_metrics,
                     show_statistics: self.show_statistics,
                     registry: self.registry.clone(),
+                    synopsis_registry: self.synopsis_registry.clone(),
                     show_schema: self.show_schema,
                     metric_types: &self.metric_types,
                     metric_categories: self.metric_categories.as_deref(),
@@ -319,6 +330,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: self.show_metrics,
             show_statistics: self.show_statistics,
             registry: self.registry.clone(),
+            synopsis_registry: self.synopsis_registry.clone(),
             show_schema: self.show_schema,
             metric_types: self.metric_types.clone(),
             metric_categories: self.metric_categories.clone(),
@@ -343,6 +355,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics,
             show_statistics: bool,
             registry: StatisticsRegistry,
+            synopsis_registry: SynopsisRegistry,
             metric_types: Vec<MetricType>,
             metric_categories: Option<Vec<MetricCategory>>,
             metric_names: Option<Vec<String>>,
@@ -357,6 +370,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     show_metrics: self.show_metrics,
                     show_statistics: self.show_statistics,
                     registry: self.registry.clone(),
+                    synopsis_registry: self.synopsis_registry.clone(),
                     metric_types: &self.metric_types,
                     metric_categories: self.metric_categories.as_deref(),
                     metric_names: self.metric_names.as_deref(),
@@ -378,6 +392,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: self.show_metrics,
             show_statistics: self.show_statistics,
             registry: self.registry.clone(),
+            synopsis_registry: self.synopsis_registry.clone(),
             metric_types: self.metric_types.clone(),
             metric_categories: self.metric_categories.clone(),
             metric_names: self.metric_names.clone(),
@@ -487,6 +502,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics,
             show_statistics: bool,
             registry: StatisticsRegistry,
+            synopsis_registry: SynopsisRegistry,
             show_schema: bool,
             metric_types: Vec<MetricType>,
             metric_categories: Option<Vec<MetricCategory>>,
@@ -502,6 +518,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     show_metrics: self.show_metrics,
                     show_statistics: self.show_statistics,
                     registry: self.registry.clone(),
+                    synopsis_registry: self.synopsis_registry.clone(),
                     show_schema: self.show_schema,
                     metric_types: &self.metric_types,
                     metric_categories: self.metric_categories.as_deref(),
@@ -517,6 +534,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: self.show_metrics,
             show_statistics: self.show_statistics,
             registry: self.registry.clone(),
+            synopsis_registry: self.synopsis_registry.clone(),
             show_schema: self.show_schema,
             metric_types: self.metric_types.clone(),
             metric_categories: self.metric_categories.clone(),
@@ -559,6 +577,7 @@ struct IndentVisitor<'a, 'b> {
     /// If statistics should be displayed
     show_statistics: bool,
     registry: StatisticsRegistry,
+    synopsis_registry: SynopsisRegistry,
     /// If schema should be displayed
     show_schema: bool,
     /// Which metric types should be rendered
@@ -567,6 +586,14 @@ struct IndentVisitor<'a, 'b> {
     metric_categories: Option<&'a [MetricCategory]>,
     /// Optional filter by metric name.
     metric_names: Option<&'a [String]>,
+}
+
+fn statistics_context(
+    registry: &StatisticsRegistry,
+    synopsis_registry: &SynopsisRegistry,
+) -> StatisticsContext {
+    StatisticsContext::new_with_registry(registry.clone())
+        .with_synopsis_registry(synopsis_registry.clone())
 }
 
 impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
@@ -610,7 +637,7 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
             }
         }
         if self.show_statistics {
-            let stats = StatisticsContext::new_with_registry(self.registry.clone())
+            let stats = statistics_context(&self.registry, &self.synopsis_registry)
                 .compute(plan, &StatisticsArgs::new())
                 .map_err(|_e| fmt::Error)?;
             write!(self.f, ", statistics=[{stats}]")?;
@@ -642,6 +669,7 @@ struct GraphvizVisitor<'a, 'b> {
     /// If statistics should be displayed
     show_statistics: bool,
     registry: StatisticsRegistry,
+    synopsis_registry: SynopsisRegistry,
     /// Which metric types should be rendered
     metric_types: &'a [MetricType],
     /// Optional filter by semantic category
@@ -717,7 +745,7 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
         };
 
         let statistics = if self.show_statistics {
-            let stats = StatisticsContext::new_with_registry(self.registry.clone())
+            let stats = statistics_context(&self.registry, &self.synopsis_registry)
                 .compute(plan, &StatisticsArgs::new())
                 .map_err(|_e| fmt::Error)?;
             format!("statistics=[{stats}]")

@@ -93,6 +93,13 @@ use crate::projection::ProjectionExec;
 use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
 use crate::union::UnionExec;
 
+// Lets a crate use the synopsis types without depending directly on
+// `datafusion-physical-expr`.
+pub use datafusion_physical_expr::synopsis_registry::{
+    SynopsisContext, SynopsisProvider, SynopsisRegistry, SynopsisResult,
+};
+pub use datafusion_physical_expr_common::synopsis::ExprSynopsis;
+
 // ============================================================================
 // ExtendedStatistics: Statistics with type-safe extensions
 // ============================================================================

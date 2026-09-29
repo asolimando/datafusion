@@ -43,6 +43,7 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 
 use futures::StreamExt;
 
@@ -63,6 +64,8 @@ pub struct AnalyzeExec {
     /// Registry consulted when rendering displayed statistics, so `EXPLAIN
     /// ANALYZE` reflects the same provider-refined stats as plain `EXPLAIN`.
     statistics_registry: StatisticsRegistry,
+    /// Synopsis registry consulted when rendering displayed statistics.
+    synopsis_registry: SynopsisRegistry,
     /// The input plan (the plan being analyzed)
     pub(crate) input: Arc<dyn ExecutionPlan>,
     /// The output schema for RecordBatches of this exec node
@@ -82,6 +85,7 @@ pub struct AnalyzeExecBuilder {
     metric_categories: Option<Vec<MetricCategory>>,
     format: ExplainFormat,
     statistics_registry: StatisticsRegistry,
+    synopsis_registry: SynopsisRegistry,
 }
 
 impl AnalyzeExecBuilder {
@@ -100,6 +104,7 @@ impl AnalyzeExecBuilder {
             metric_categories: None,
             format: ExplainFormat::Indent,
             statistics_registry: StatisticsRegistry::new(),
+            synopsis_registry: SynopsisRegistry::new(),
         }
     }
 
@@ -126,6 +131,11 @@ impl AnalyzeExecBuilder {
         self
     }
 
+    pub fn with_synopsis_registry(mut self, synopsis_registry: SynopsisRegistry) -> Self {
+        self.synopsis_registry = synopsis_registry;
+        self
+    }
+
     pub fn build(self) -> AnalyzeExec {
         let cache =
             AnalyzeExec::compute_properties(&self.input, Arc::clone(&self.schema));
@@ -136,6 +146,7 @@ impl AnalyzeExecBuilder {
             metric_categories: self.metric_categories,
             format: self.format,
             statistics_registry: self.statistics_registry,
+            synopsis_registry: self.synopsis_registry,
             input: self.input,
             schema: self.schema,
             cache: Arc::new(cache),
@@ -259,6 +270,7 @@ impl ExecutionPlan for AnalyzeExec {
             .with_metric_categories(self.metric_categories.clone())
             .with_format(self.format.clone())
             .with_statistics_registry(self.statistics_registry.clone())
+            .with_synopsis_registry(self.synopsis_registry.clone())
             .build(),
         ))
     }
@@ -309,6 +321,7 @@ impl ExecutionPlan for AnalyzeExec {
         let metric_categories = self.metric_categories.clone();
         let format = self.format.clone();
         let statistics_registry = self.statistics_registry.clone();
+        let synopsis_registry = self.synopsis_registry.clone();
 
         // future that gathers the results from all the tasks in the
         // JoinSet that computes the overall row count and final
@@ -333,6 +346,7 @@ impl ExecutionPlan for AnalyzeExec {
                 metric_categories.as_deref(),
                 &format,
                 &statistics_registry,
+                &synopsis_registry,
             )
         };
 
@@ -364,6 +378,7 @@ impl ExecutionPlan for AnalyzeExec {
             cache: _,
             // Session-injected for display only; not part of the serialized plan.
             statistics_registry: _,
+            synopsis_registry: _,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -516,6 +531,7 @@ fn create_output_batch(
     metric_categories: Option<&[MetricCategory]>,
     format: &ExplainFormat,
     statistics_registry: &StatisticsRegistry,
+    synopsis_registry: &SynopsisRegistry,
 ) -> Result<RecordBatch> {
     let mut type_builder = StringBuilder::with_capacity(1, 1024);
     let mut plan_builder = StringBuilder::with_capacity(1, 1024);
@@ -529,6 +545,7 @@ fn create_output_batch(
                 .set_metric_categories(metric_categories.map(|c| c.to_vec()))
                 .set_show_statistics(show_statistics)
                 .set_statistics_registry(statistics_registry.clone())
+                .set_synopsis_registry(synopsis_registry.clone())
                 .indent(verbose)
                 .to_string();
             plan_builder.append_value(annotated_plan);
@@ -542,6 +559,7 @@ fn create_output_batch(
                         .set_metric_categories(metric_categories.map(|c| c.to_vec()))
                         .set_show_statistics(show_statistics)
                         .set_statistics_registry(statistics_registry.clone())
+                        .set_synopsis_registry(synopsis_registry.clone())
                         .indent(verbose)
                         .to_string();
                 plan_builder.append_value(annotated_plan);

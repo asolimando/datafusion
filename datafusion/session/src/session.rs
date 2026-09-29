@@ -26,7 +26,9 @@ use datafusion_expr::registry::ExtensionTypeRegistryRef;
 use datafusion_expr::{
     AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, WindowUDF,
 };
-use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
+use datafusion_physical_plan::operator_statistics::{
+    StatisticsRegistry, SynopsisRegistry,
+};
 use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr};
 
 use crate::CatalogProviderList;
@@ -137,6 +139,12 @@ pub trait Session: Send + Sync {
 
     /// Return the optional statistics registry used during physical optimization.
     fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
+        None
+    }
+
+    /// Return the optional synopsis registry used during expression-level
+    /// statistics estimation.
+    fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
         None
     }
 

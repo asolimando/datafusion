@@ -967,6 +967,7 @@ mod tests {
             state.physical_optimizers().len()
         );
         assert!(foreign_session.statistics_registry().is_none());
+        assert!(foreign_session.synopsis_registry().is_none());
         let planned = foreign_session
             .query_planner()
             .create_physical_plan(&logical_plan, &foreign_session)

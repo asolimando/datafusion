@@ -66,6 +66,10 @@ fn get_stats(
         Some(reg) => StatisticsContext::new_with_registry(reg.clone()),
         None => StatisticsContext::new(),
     };
+    let ctx = match context.synopsis_registry() {
+        Some(reg) => ctx.with_synopsis_registry(reg.clone()),
+        None => ctx,
+    };
     ctx.compute(plan, &StatisticsArgs::new())
 }
 

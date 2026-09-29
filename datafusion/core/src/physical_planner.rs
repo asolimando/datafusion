@@ -97,6 +97,7 @@ use datafusion_physical_expr::aggregate::{
     AggregateFunctionExpr, LoweredAggregate, LoweredAggregateBuilder,
 };
 use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::synopsis_registry::SynopsisRegistry;
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
@@ -134,6 +135,10 @@ impl PhysicalOptimizerContext for SessionOptimizerContext<'_> {
         &self,
     ) -> Option<&datafusion_physical_plan::operator_statistics::StatisticsRegistry> {
         self.session.statistics_registry()
+    }
+
+    fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
+        self.session.synopsis_registry()
     }
 }
 
@@ -2873,6 +2878,10 @@ impl DefaultPhysicalPlanner {
             .statistics_registry()
             .cloned()
             .unwrap_or_default();
+        let synopsis_registry = session_state
+            .synopsis_registry()
+            .cloned()
+            .unwrap_or_default();
 
         if !e.logical_optimization_succeeded {
             return Ok(Arc::new(ExplainExec::new(
@@ -2941,6 +2950,7 @@ impl DefaultPhysicalPlanner {
                     displayable(plan)
                         .set_show_statistics(show_statistics)
                         .set_statistics_registry(statistics_registry.clone())
+                        .set_synopsis_registry(synopsis_registry.clone())
                         .set_show_schema(show_schema)
                         .indent(e.verbose)
                         .to_string()
@@ -3080,12 +3090,17 @@ impl DefaultPhysicalPlanner {
             .statistics_registry()
             .cloned()
             .unwrap_or_default();
+        let synopsis_registry = session_state
+            .synopsis_registry()
+            .cloned()
+            .unwrap_or_default();
         Ok(Arc::new(
             AnalyzeExec::builder(a.verbose, show_statistics, input, schema)
                 .with_metric_types(metric_types)
                 .with_metric_categories(metric_categories)
                 .with_format(a.format.clone())
                 .with_statistics_registry(statistics_registry)
+                .with_synopsis_registry(synopsis_registry)
                 .build(),
         ))
     }

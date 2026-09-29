@@ -23,7 +23,9 @@ use std::sync::Arc;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
+use datafusion_physical_plan::operator_statistics::{
+    StatisticsRegistry, SynopsisRegistry,
+};
 
 /// Context available to physical optimizer rules.
 ///
@@ -38,6 +40,14 @@ pub trait PhysicalOptimizerContext: Send + Sync {
     /// Returns `None` if no registry is configured, in which case rules
     /// should fall back to using [`ExecutionPlan::partition_statistics`].
     fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
+        None
+    }
+
+    /// Returns the synopsis registry for expression-level statistics lookup.
+    ///
+    /// Returns `None` if no registry is configured, in which case expressions
+    /// use only their built-in `synopsis_from_inputs` rules.
+    fn synopsis_registry(&self) -> Option<&SynopsisRegistry> {
         None
     }
 }
