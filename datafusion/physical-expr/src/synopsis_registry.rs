@@ -348,6 +348,9 @@ impl<'a> SynopsisContext<'a> {
         if result.is_none() {
             result = self.compute_from_children(expr, &data_type);
         }
+        if let Some(synopsis) = result.as_mut() {
+            self.fill_missing_distinct_count(synopsis);
+        }
 
         self.cache
             .borrow_mut()
@@ -539,6 +542,41 @@ impl<'a> SynopsisContext<'a> {
         let column = expr.downcast_ref::<Column>()?;
         let statistics = estimate.column_statistics(column.index(), &self.args)?;
         Some(ExprSynopsis::from_column(statistics, data_type.clone()))
+    }
+
+    /// Fills a missing distinct count with the number of values in the range,
+    /// or in the type for a Boolean, when that is below the row count: the
+    /// input's, or under a condition the rows that satisfy it. A larger number
+    /// says nothing new, since there is at most one value per row.
+    fn fill_missing_distinct_count(&self, synopsis: &mut ExprSynopsis) {
+        if synopsis.column.distinct_count != Precision::Absent {
+            return;
+        }
+        let interval = match (
+            synopsis.column.min_value.get_value(),
+            synopsis.column.max_value.get_value(),
+        ) {
+            (Some(min), Some(max)) => Interval::try_new(min.clone(), max.clone()).ok(),
+            _ if synopsis.data_type == DataType::Boolean => {
+                Interval::make_unbounded(&DataType::Boolean).ok()
+            }
+            _ => None,
+        };
+        let num_rows = match &self.condition_estimate {
+            Some(estimate) => estimate.filtered_num_rows,
+            None => self.args.input_stats().num_rows,
+        };
+        let (Some(cardinality), Some(&rows)) = (
+            interval.and_then(|interval| interval.cardinality()),
+            num_rows.get_value(),
+        ) else {
+            return;
+        };
+        if let Ok(cardinality) = usize::try_from(cardinality)
+            && cardinality < rows
+        {
+            synopsis.column.distinct_count = Precision::Inexact(cardinality);
+        }
     }
 
     /// Fills a missing range of a provider's answer for a non-leaf `expr`,
@@ -1517,6 +1555,49 @@ mod tests {
             synopsis.column.max_value,
             Precision::Inexact(ScalarValue::Float64(Some(399.0))),
             "the missing maximum comes from evaluate_bounds"
+        );
+    }
+
+    // A missing distinct count is the number of values the range holds, or
+    // the type holds for a Boolean, when that is below the row count.
+    #[test]
+    fn distinct_count_from_the_size_of_the_range() {
+        let int = |v: i32| ScalarValue::Int32(Some(v));
+        let range = |min: i32, max: i32| ColumnStatistics {
+            min_value: Precision::Exact(int(min)),
+            max_value: Precision::Exact(int(max)),
+            ..ColumnStatistics::new_unknown()
+        };
+        let stats = Statistics {
+            num_rows: Precision::Exact(10_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![range(0, 99), range(200, 300), range(0, 1_000_000)],
+        };
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]);
+        let ctx = SynopsisContext::new(&stats, &schema);
+        let ndv = |expr: &Arc<dyn PhysicalExpr>| {
+            ctx.compute(expr).map(|s| s.column.distinct_count)
+        };
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("c", 2));
+
+        let sum: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Plus, b));
+        assert_eq!(ndv(&sum), Some(Precision::Inexact(200)), "[200, 399]");
+
+        let gt: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(a, Operator::Gt, lit(50_i32)));
+        assert_eq!(ndv(&gt), Some(Precision::Inexact(2)), "true and false");
+
+        assert_eq!(
+            ndv(&c),
+            Some(Precision::Absent),
+            "a range larger than the row count says nothing new"
         );
     }
 

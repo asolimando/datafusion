@@ -936,6 +936,11 @@ impl Interval {
                 }
                 _ => None,
             }
+        } else if data_type == DataType::Boolean {
+            // An unbounded endpoint stands for `false` below and `true` above.
+            let lower = matches!(self.lower, ScalarValue::Boolean(Some(true)));
+            let upper = !matches!(self.upper, ScalarValue::Boolean(Some(false)));
+            u64::from(upper).checked_sub(u64::from(lower))
         } else {
             // Cardinality calculations are not implemented for this data type yet:
             None
@@ -4168,6 +4173,14 @@ mod tests {
             ScalarValue::Float32(Some(0.0_f32)),
         )?;
         assert_eq!(interval.cardinality().unwrap(), 2);
+
+        // Boolean
+        assert_eq!(
+            Interval::make_unbounded(&DataType::Boolean)?.cardinality(),
+            Some(2)
+        );
+        assert_eq!(Interval::TRUE.cardinality(), Some(1));
+        assert_eq!(Interval::FALSE.cardinality(), Some(1));
 
         // Temporal types
         let interval = Interval::try_new(

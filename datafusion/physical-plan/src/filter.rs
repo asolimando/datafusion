@@ -1911,9 +1911,10 @@ mod tests {
                 Arc::new(Column::new("b", 1)),
             )),
         ));
-        // The filter predicate passes all (non-null) entries, so min/max/NDV
-        // are unchanged. `a < 200` and `1 <= b` are null-rejecting, though, so
-        // both columns lose any nulls regardless of selectivity.
+        // The filter predicate passes all (non-null) entries, so min/max are
+        // unchanged, and each distinct count is the size of its column's range.
+        // `a < 200` and `1 <= b` are null-rejecting, though, so both columns
+        // lose any nulls regardless of selectivity.
         let mut expected = StatisticsContext::new()
             .compute(input.as_ref(), &StatisticsArgs::new())?
             .column_statistics
@@ -1921,6 +1922,8 @@ mod tests {
         for col in &mut expected {
             col.null_count = Precision::Exact(0);
         }
+        expected[0].distinct_count = Precision::Inexact(100);
+        expected[1].distinct_count = Precision::Inexact(3);
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
         let statistics =
@@ -2118,13 +2121,15 @@ mod tests {
                     null_count: Precision::Exact(0),
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(49))),
+                    distinct_count: Precision::Inexact(49),
                     ..Default::default()
                 },
-                // `b` is not referenced by the predicate, so its stats are
-                // unchanged (null count stays unknown).
+                // `b` is not referenced by the predicate, so it keeps its range
+                // and its null count stays unknown.
                 ColumnStatistics {
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
+                    distinct_count: Precision::Inexact(100),
                     ..Default::default()
                 },
             ]
