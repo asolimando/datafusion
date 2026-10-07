@@ -629,6 +629,7 @@ message ParquetOptions {
   // "start_offset" or "midpoint". Empty means "start_offset".
   string row_group_range_assignment = 39;
   bool enable_rle_to_dictionary = 40;
+  bool estimate_distinct_count_from_metadata = 41;
 
   string created_by = 16;
 

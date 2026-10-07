@@ -6497,6 +6497,9 @@ impl serde::Serialize for ParquetOptions {
         if self.enable_rle_to_dictionary {
             len += 1;
         }
+        if self.estimate_distinct_count_from_metadata {
+            len += 1;
+        }
         if !self.created_by.is_empty() {
             len += 1;
         }
@@ -6627,6 +6630,9 @@ impl serde::Serialize for ParquetOptions {
         }
         if self.enable_rle_to_dictionary {
             struct_ser.serialize_field("enableRleToDictionary", &self.enable_rle_to_dictionary)?;
+        }
+        if self.estimate_distinct_count_from_metadata {
+            struct_ser.serialize_field("estimateDistinctCountFromMetadata", &self.estimate_distinct_count_from_metadata)?;
         }
         if !self.created_by.is_empty() {
             struct_ser.serialize_field("createdBy", &self.created_by)?;
@@ -6792,6 +6798,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "rowGroupRangeAssignment",
             "enable_rle_to_dictionary",
             "enableRleToDictionary",
+            "estimate_distinct_count_from_metadata",
+            "estimateDistinctCountFromMetadata",
             "created_by",
             "createdBy",
             "content_defined_chunking",
@@ -6847,6 +6855,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             MaxInListSize,
             RowGroupRangeAssignment,
             EnableRleToDictionary,
+            EstimateDistinctCountFromMetadata,
             CreatedBy,
             ContentDefinedChunking,
             MetadataSizeHint,
@@ -6906,6 +6915,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "maxInListSize" | "max_in_list_size" => Ok(GeneratedField::MaxInListSize),
                             "rowGroupRangeAssignment" | "row_group_range_assignment" => Ok(GeneratedField::RowGroupRangeAssignment),
                             "enableRleToDictionary" | "enable_rle_to_dictionary" => Ok(GeneratedField::EnableRleToDictionary),
+                            "estimateDistinctCountFromMetadata" | "estimate_distinct_count_from_metadata" => Ok(GeneratedField::EstimateDistinctCountFromMetadata),
                             "createdBy" | "created_by" => Ok(GeneratedField::CreatedBy),
                             "contentDefinedChunking" | "content_defined_chunking" => Ok(GeneratedField::ContentDefinedChunking),
                             "metadataSizeHint" | "metadata_size_hint" => Ok(GeneratedField::MetadataSizeHint),
@@ -6963,6 +6973,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut max_in_list_size__ = None;
                 let mut row_group_range_assignment__ = None;
                 let mut enable_rle_to_dictionary__ = None;
+                let mut estimate_distinct_count_from_metadata__ = None;
                 let mut created_by__ = None;
                 let mut content_defined_chunking__ = None;
                 let mut metadata_size_hint_opt__ = None;
@@ -7134,6 +7145,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             enable_rle_to_dictionary__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::EstimateDistinctCountFromMetadata => {
+                            if estimate_distinct_count_from_metadata__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("estimateDistinctCountFromMetadata"));
+                            }
+                            estimate_distinct_count_from_metadata__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::CreatedBy => {
                             if created_by__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("createdBy"));
@@ -7250,6 +7267,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     max_in_list_size: max_in_list_size__.unwrap_or_default(),
                     row_group_range_assignment: row_group_range_assignment__.unwrap_or_default(),
                     enable_rle_to_dictionary: enable_rle_to_dictionary__.unwrap_or_default(),
+                    estimate_distinct_count_from_metadata: estimate_distinct_count_from_metadata__.unwrap_or_default(),
                     created_by: created_by__.unwrap_or_default(),
                     content_defined_chunking: content_defined_chunking__,
                     metadata_size_hint_opt: metadata_size_hint_opt__,

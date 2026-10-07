@@ -250,6 +250,7 @@ impl ParquetOptions {
             max_predicate_cache_size: _,
             max_in_list_size: _,
             enable_rle_to_dictionary: _,
+            estimate_distinct_count_from_metadata: _,
             row_group_range_assignment: _,
         } = self;
 
@@ -431,6 +432,8 @@ mod tests {
             max_predicate_cache_size: defaults.max_predicate_cache_size,
             content_defined_chunking: defaults.content_defined_chunking.clone(),
             enable_rle_to_dictionary: defaults.enable_rle_to_dictionary,
+            estimate_distinct_count_from_metadata: defaults
+                .estimate_distinct_count_from_metadata,
         }
     }
 
@@ -562,6 +565,8 @@ mod tests {
                 content_defined_chunking: props.content_defined_chunking().into(),
                 enable_rle_to_dictionary: global_options_defaults
                     .enable_rle_to_dictionary,
+                estimate_distinct_count_from_metadata: global_options_defaults
+                    .estimate_distinct_count_from_metadata,
             },
             column_specific_options,
             key_value_metadata,

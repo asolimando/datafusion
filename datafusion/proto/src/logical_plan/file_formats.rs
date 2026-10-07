@@ -280,7 +280,7 @@ mod parquet {
     mod tests {
         use super::*;
         use crate::protobuf::ParquetOptions as ParquetOptionsProto;
-        use datafusion_common::config::ParquetOptions;
+        use datafusion_common::config::{ParquetOptions, TableParquetOptions};
 
         fn encode_table_options(proto: TableParquetOptionsProto) -> Vec<u8> {
             let mut buf = Vec::new();
@@ -364,6 +364,32 @@ mod parquet {
                 .expect("parquet options");
 
             assert!(decoded_options.global.enable_rle_to_dictionary);
+        }
+
+        #[test]
+        fn estimate_distinct_count_from_metadata_round_trips_through_codec() {
+            let mut options = TableParquetOptions::default();
+            options.global.estimate_distinct_count_from_metadata = true;
+            let original: Arc<dyn FileFormatFactory> = Arc::new(ParquetFormatFactory {
+                options: Some(options),
+            });
+
+            let mut buf = Vec::new();
+            ParquetLogicalExtensionCodec
+                .try_encode_file_format(&mut buf, Arc::clone(&original))
+                .expect("encode parquet options");
+
+            let decoded = ParquetLogicalExtensionCodec
+                .try_decode_file_format(&buf, &TaskContext::default())
+                .expect("decode parquet options");
+            let decoded_options = decoded
+                .downcast_ref::<ParquetFormatFactory>()
+                .expect("parquet format factory")
+                .options
+                .as_ref()
+                .expect("parquet options");
+
+            assert!(decoded_options.global.estimate_distinct_count_from_metadata);
         }
     }
 }

@@ -1294,6 +1294,8 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
             }).transpose()?,
             content_defined_chunking: value.content_defined_chunking.map(ParquetCdcOptions::try_from).transpose()?.unwrap_or_default(),
             enable_rle_to_dictionary: value.enable_rle_to_dictionary,
+            estimate_distinct_count_from_metadata: value
+                .estimate_distinct_count_from_metadata,
         })
     }
 }

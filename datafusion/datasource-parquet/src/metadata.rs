@@ -21,7 +21,7 @@
 use crate::file_format::ObjectStoreFetch;
 use crate::{Int96Coercer, apply_file_schema_type_coercions};
 use arrow::array::{Array, ArrayRef, BooleanArray};
-use arrow::compute::kernels::cmp::eq;
+use arrow::compute::kernels::cmp::{eq, lt_eq};
 use arrow::compute::{and, sum};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion_common::encryption::FileDecryptionProperties;
@@ -43,14 +43,15 @@ use object_store::{ObjectMeta, ObjectStore};
 use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::{parquet_column, parquet_to_arrow_schema};
-use parquet::basic::{ColumnOrder, SortOrder, Type as PhysicalType};
+use parquet::basic::{ColumnOrder, Compression, SortOrder, Type as PhysicalType};
 use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder, ParquetMetaDataReader,
-    RowGroupMetaData, SortingColumn,
+    ColumnChunkMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder,
+    ParquetMetaDataReader, RowGroupMetaData, SortingColumn,
 };
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 use std::any::Any;
+use std::f64::consts::LN_2;
 use std::sync::Arc;
 
 /// Minimum fraction of row groups that must report NDV statistics for the
@@ -154,6 +155,9 @@ pub struct DFParquetMetadata<'a> {
     pub coerce_int96_tz: Option<Arc<str>>,
     /// If true, promote string/binary columns with dictionary pages to `Dictionary(Int32, ...)`.
     enable_rle_to_dictionary: bool,
+    /// If true, estimate the distinct count of columns that do not carry a written
+    /// `distinct_count` from dictionary page sizes and row group min/max statistics.
+    estimate_distinct_count: bool,
 }
 
 impl<'a> DFParquetMetadata<'a> {
@@ -172,7 +176,16 @@ impl<'a> DFParquetMetadata<'a> {
             coerce_int96: None,
             coerce_int96_tz: None,
             enable_rle_to_dictionary: false,
+            estimate_distinct_count: false,
         }
+    }
+
+    /// Estimate the distinct count of columns that do not carry a written
+    /// `distinct_count`, using dictionary page sizes and row group min/max
+    /// statistics. The estimate is always [`Precision::Inexact`].
+    pub fn with_estimate_distinct_count(mut self, estimate: bool) -> Self {
+        self.estimate_distinct_count = estimate;
+        self
     }
 
     /// Promote string/binary columns with dictionary pages to `Dictionary(Int32, ...)`.
@@ -535,7 +548,11 @@ impl<'a> DFParquetMetadata<'a> {
     /// the statistics in the metadata using [`Self::statistics_from_parquet_metadata`]
     pub async fn fetch_statistics(&self, table_schema: &SchemaRef) -> Result<Statistics> {
         let metadata = self.fetch_metadata().await?;
-        Self::statistics_from_parquet_metadata(&metadata, table_schema)
+        Self::statistics_from_parquet_metadata_with_options(
+            &metadata,
+            table_schema,
+            self.estimate_distinct_count,
+        )
     }
 
     /// Convert statistics in [`ParquetMetaData`] into [`Statistics`] using [`StatisticsConverter`]
@@ -578,6 +595,22 @@ impl<'a> DFParquetMetadata<'a> {
     pub fn statistics_from_parquet_metadata(
         metadata: &ParquetMetaData,
         logical_file_schema: &SchemaRef,
+    ) -> Result<Statistics> {
+        Self::statistics_from_parquet_metadata_with_options(
+            metadata,
+            logical_file_schema,
+            false,
+        )
+    }
+
+    /// Same as [`Self::statistics_from_parquet_metadata`]. When
+    /// `estimate_distinct_count` is true, columns without a written
+    /// `distinct_count` get an inexact estimate, see
+    /// [`estimate_distinct_count_from_metadata`].
+    pub(crate) fn statistics_from_parquet_metadata_with_options(
+        metadata: &ParquetMetaData,
+        logical_file_schema: &SchemaRef,
+        estimate_distinct_count: bool,
     ) -> Result<Statistics> {
         let row_groups_metadata = metadata.row_groups();
 
@@ -669,6 +702,7 @@ impl<'a> DFParquetMetadata<'a> {
                                 &stats_converter,
                                 row_groups_metadata,
                                 num_rows,
+                                estimate_distinct_count,
                             )
                             .ok();
                         }
@@ -821,6 +855,7 @@ fn summarize_column_statistics(
     stats_converter: &StatisticsConverter,
     row_groups_metadata: &[RowGroupMetaData],
     num_rows: usize,
+    estimate_distinct_count: bool,
 ) -> Result<()> {
     let parquet_index = stats_converter.parquet_column_index();
 
@@ -851,6 +886,41 @@ fn summarize_column_statistics(
 
     accumulators.distinct_counts_array[logical_schema_index] =
         summarize_distinct_counts(parquet_index, row_groups_metadata);
+
+    if estimate_distinct_count
+        && accumulators.distinct_counts_array[logical_schema_index] == Precision::Absent
+        && let Some(parquet_index) = parquet_index
+    {
+        let min = accumulators.min_accs[logical_schema_index]
+            .as_mut()
+            .and_then(|acc| acc.evaluate().ok());
+        let max = accumulators.max_accs[logical_schema_index]
+            .as_mut()
+            .and_then(|acc| acc.evaluate().ok());
+        let value_range = min
+            .zip(max)
+            .and_then(|(min, max)| integer_value_range(&min, &max));
+        // The accumulators are cleared when the min/max order is untrusted
+        let shared_boundaries = if accumulators.min_accs[logical_schema_index].is_some()
+            && accumulators.max_accs[logical_schema_index].is_some()
+        {
+            disjoint_row_groups_shared_boundaries(
+                &stats_converter.row_group_mins(row_groups_metadata)?,
+                &stats_converter.row_group_maxes(row_groups_metadata)?,
+            )?
+        } else {
+            None
+        };
+        if let Some(estimate) = estimate_distinct_count_from_metadata(
+            parquet_index,
+            row_groups_metadata,
+            value_range,
+            shared_boundaries,
+        ) {
+            accumulators.distinct_counts_array[logical_schema_index] =
+                Precision::Inexact(estimate);
+        }
+    }
 
     let arrow_field = logical_file_schema.field(logical_schema_index);
     accumulators.column_byte_sizes[logical_schema_index] = compute_arrow_column_size(
@@ -1045,6 +1115,389 @@ fn summarize_distinct_counts(
         Some(distinct_count) => Precision::Inexact(distinct_count as usize),
         None => Precision::Absent,
     }
+}
+
+/// Bytes that precede each value in a PLAIN encoded `BYTE_ARRAY` dictionary page.
+const BYTE_ARRAY_LENGTH_PREFIX_BYTES: f64 = 4.0;
+
+/// Maximum number of iterations of the Newton-Raphson solvers.
+const NEWTON_MAX_ITERATIONS: usize = 50;
+
+/// Convergence tolerance of the Newton-Raphson solvers.
+const NEWTON_TOLERANCE: f64 = 1e-6;
+
+/// Fraction of a row group's non-null values that must be distinct for the
+/// row group to count as nearly unique.
+const NEARLY_UNIQUE_FRACTION: f64 = 0.9;
+
+/// Upper estimate of the size of the Thrift encoded dictionary page header,
+/// which is usually 15 to 30 bytes.
+const DICTIONARY_PAGE_HEADER_BYTES: i64 = 32;
+
+/// Minimum number of non-null values per possible value of an integer column
+/// for the range fill floor to apply, see [`range_fill_floor`].
+const RANGE_FILL_MIN_ROWS_PER_VALUE: f64 = 10.0;
+
+/// Ranges up to this size get the range fill floor without dictionary
+/// evidence, see [`range_fill_floor`].
+const RANGE_FILL_MAX_UNCHECKED_RANGE: u128 = 16;
+
+/// Minimum stored dictionary bytes per possible value for the range fill floor
+/// to apply to larger ranges, see [`range_fill_floor`].
+const RANGE_FILL_MIN_DICTIONARY_BYTES_PER_VALUE: f64 = 0.5;
+
+/// Estimate the number of distinct non-null values of a column from Parquet
+/// metadata only, following "Zero-Cost NDV Estimation from Columnar File
+/// Metadata" (<https://arxiv.org/abs/2603.24606>).
+///
+/// Two signals are computed and the larger one is used:
+///
+/// 1. Dictionary size: the uncompressed size of a dictionary encoded column
+///    chunk is inverted to a distinct count, see [`invert_dictionary_size`].
+///    A lower bound from the dictionary page size corrects the inversion for
+///    run length encoded indexes. The paper does not say how to combine row
+///    groups. When `shared_boundaries` is set the row groups share no values
+///    except that many boundary values, so the per row group counts are added
+///    and the shared values are subtracted. The counts are also added when
+///    every row group is nearly unique. Otherwise the maximum is used, which
+///    assumes the values are spread across row groups.
+/// 2. Row group min/max diversity: the number of distinct row group minimums
+///    and maximums is inverted with a coupon collector model, see
+///    [`invert_coupon_collector`].
+///
+/// The number of distinct extreme values is a lower bound of the distinct
+/// count. It is applied to the result, but is not used as an estimate on its
+/// own: with few row groups it is far below the real count.
+///
+/// The result is capped by the number of non-null values and, for integer like
+/// columns, by `value_range`, the number of integers between the file minimum
+/// and maximum. Returns `None` when neither signal is available.
+fn estimate_distinct_count_from_metadata(
+    parquet_idx: usize,
+    row_groups_metadata: &[RowGroupMetaData],
+    value_range: Option<u128>,
+    shared_boundaries: Option<usize>,
+) -> Option<usize> {
+    let chunks: Vec<(&RowGroupMetaData, &ColumnChunkMetaData)> = row_groups_metadata
+        .iter()
+        .filter_map(|row_group| {
+            row_group
+                .columns()
+                .get(parquet_idx)
+                .map(|chunk| (row_group, chunk))
+        })
+        .collect();
+    let first_chunk = chunks.first()?.1;
+    let physical_type = first_chunk.column_type();
+    if physical_type == PhysicalType::BOOLEAN {
+        return None;
+    }
+
+    let mut distinct_mins: HashSet<&[u8]> = HashSet::new();
+    let mut distinct_maxs: HashSet<&[u8]> = HashSet::new();
+    let mut row_groups_with_stats = 0_usize;
+    for stats in chunks.iter().filter_map(|(_, chunk)| chunk.statistics()) {
+        if let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) {
+            row_groups_with_stats += 1;
+            distinct_mins.insert(min);
+            distinct_maxs.insert(max);
+        }
+    }
+    let extrema: HashSet<&[u8]> = distinct_mins.union(&distinct_maxs).copied().collect();
+
+    let value_length = match physical_type {
+        PhysicalType::BYTE_ARRAY => (!extrema.is_empty()).then(|| {
+            let total: usize = extrema.iter().map(|value| value.len()).sum();
+            total as f64 / extrema.len() as f64 + BYTE_ARRAY_LENGTH_PREFIX_BYTES
+        }),
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            Some(first_chunk.column_descr().type_length() as f64)
+        }
+        PhysicalType::INT32 | PhysicalType::FLOAT => Some(4.0),
+        PhysicalType::INT64 | PhysicalType::DOUBLE => Some(8.0),
+        PhysicalType::INT96 => Some(12.0),
+        PhysicalType::BOOLEAN => None,
+    };
+
+    // A chunk that starts dictionary encoded and falls back to PLAIN pages is
+    // not treated specially: its size is larger, so the inverted count is high
+    // and is capped by the number of non-null values below.
+    //
+    // Each entry is the estimate of one row group and its non-null count.
+    let mut row_group_estimates: Vec<(f64, f64)> = vec![];
+    // Stored dictionary bytes without the fixed overhead, over all row groups
+    let mut total_dictionary_bytes = 0_i64;
+    if let Some(value_length) = value_length {
+        for (row_group, chunk) in &chunks {
+            let Some(dictionary_offset) = chunk.dictionary_page_offset() else {
+                continue;
+            };
+            let nulls = chunk
+                .statistics()
+                .and_then(|stats| stats.null_count_opt())
+                .unwrap_or(0) as i64;
+            let non_null = row_group.num_rows().saturating_sub(nulls);
+            if non_null <= 0 || chunk.uncompressed_size() <= 0 {
+                continue;
+            }
+            let non_null = non_null as f64;
+            let inverted = invert_dictionary_size(
+                chunk.uncompressed_size() as f64,
+                non_null,
+                value_length,
+            );
+            // The size model assumes bit packed indexes. Clustered values give
+            // run length encoded indexes that are much smaller, so the inverted
+            // count collapses. The dictionary page holds every distinct value,
+            // and compression only makes it smaller, so its stored size divided
+            // by the value length is a lower bound. The stored size also includes
+            // a fixed overhead, which would otherwise dominate small dictionaries.
+            let dictionary_bytes = chunk.data_page_offset()
+                - dictionary_offset
+                - dictionary_page_overhead_bytes(chunk.compression());
+            total_dictionary_bytes += dictionary_bytes.max(0);
+            let lower_bound = dictionary_bytes.max(0) as f64 / value_length;
+            row_group_estimates.push((inverted.max(lower_bound).min(non_null), non_null));
+        }
+    }
+
+    // When almost every value of each row group is distinct, row groups are
+    // unlikely to share values, so the counts are added like for disjoint
+    // row groups. This overestimates when the same unique values repeat in
+    // every row group.
+    let all_nearly_unique = row_group_estimates
+        .iter()
+        .all(|(estimate, non_null)| *estimate >= NEARLY_UNIQUE_FRACTION * non_null);
+    let ndv_dictionary = (!row_group_estimates.is_empty()).then(|| {
+        let sum: f64 = row_group_estimates
+            .iter()
+            .map(|(estimate, _)| estimate)
+            .sum();
+        let max = row_group_estimates
+            .iter()
+            .map(|(estimate, _)| *estimate)
+            .fold(0.0, f64::max);
+        match shared_boundaries {
+            Some(shared) => (sum - shared as f64).max(max),
+            None if all_nearly_unique => sum,
+            None => max,
+        }
+    });
+
+    let ndv_coupon = [&distinct_mins, &distinct_maxs]
+        .into_iter()
+        .filter_map(|distinct| {
+            invert_coupon_collector(distinct.len(), row_groups_with_stats)
+        })
+        .reduce(f64::max);
+
+    if ndv_dictionary.is_none() && ndv_coupon.is_none() {
+        return None;
+    }
+    let estimate = ndv_dictionary
+        .unwrap_or(0.0)
+        .max(ndv_coupon.unwrap_or(0.0))
+        .max(extrema.len() as f64);
+
+    let total_rows: u64 = row_groups_metadata
+        .iter()
+        .map(|row_group| row_group.num_rows() as u64)
+        .sum();
+    let null_counts: Option<u64> = chunks
+        .iter()
+        .map(|(_, chunk)| chunk.statistics().and_then(|stats| stats.null_count_opt()))
+        .sum();
+    let non_null_values = total_rows.saturating_sub(null_counts.unwrap_or(0));
+    if non_null_values == 0 {
+        return None;
+    }
+
+    let mut estimate = estimate;
+    if let Some(fill) = value_range.and_then(|range| {
+        range_fill_floor(range, non_null_values, total_dictionary_bytes)
+    }) {
+        estimate = estimate.max(fill);
+    }
+    let mut ndv = estimate.round().clamp(1.0, non_null_values as f64) as u128;
+    if let Some(range) = value_range {
+        ndv = ndv.min(range);
+    }
+    Some(ndv as usize)
+}
+
+/// Fixed size overhead of a stored dictionary page: the page header plus the
+/// framing added by the compression codec. For example a GZIP compressed
+/// dictionary page with a single value takes 43 to 47 bytes.
+fn dictionary_page_overhead_bytes(codec: Compression) -> i64 {
+    let framing = match codec {
+        Compression::UNCOMPRESSED => 0,
+        Compression::GZIP(_) => 20,
+        Compression::ZSTD(_) => 16,
+        _ => 8,
+    };
+    DICTIONARY_PAGE_HEADER_BYTES + framing
+}
+
+/// Expected number of distinct values when `non_null` values are drawn
+/// uniformly from the `range` possible values of an integer column:
+/// `range * (1 - exp(-non_null / range))`.
+///
+/// Small integer domains (years, months, hours) compress so well that the
+/// dictionary signals underestimate them, while the value range is known. The
+/// floor applies only when there are at least [`RANGE_FILL_MIN_ROWS_PER_VALUE`]
+/// values per possible value, where the expectation is close to `range`.
+///
+/// A domain with gaps, e.g. multiples of 500 between 0 and 9500, has a small
+/// dictionary compared to its range. For ranges above
+/// [`RANGE_FILL_MAX_UNCHECKED_RANGE`], the floor therefore also requires
+/// `dictionary_bytes` (stored dictionary bytes without the fixed overhead) to
+/// hold at least [`RANGE_FILL_MIN_DICTIONARY_BYTES_PER_VALUE`] per possible
+/// value. On TPC-DS, dense domains have at least 1 byte per value and domains
+/// with gaps at most 0.25. Smaller ranges are not checked because their
+/// dictionaries are close to the fixed overhead, and the overestimate is at
+/// most the range.
+fn range_fill_floor(range: u128, non_null: u64, dictionary_bytes: i64) -> Option<f64> {
+    let dense = range <= RANGE_FILL_MAX_UNCHECKED_RANGE
+        || dictionary_bytes as f64
+            >= RANGE_FILL_MIN_DICTIONARY_BYTES_PER_VALUE * range as f64;
+    let (range, non_null) = (range as f64, non_null as f64);
+    (dense && non_null >= RANGE_FILL_MIN_ROWS_PER_VALUE * range)
+        .then(|| range * (1.0 - (-non_null / range).exp()))
+}
+
+/// Number of integers in `min..=max` when both are integer like scalars.
+fn integer_value_range(min: &ScalarValue, max: &ScalarValue) -> Option<u128> {
+    fn as_i128(value: &ScalarValue) -> Option<i128> {
+        match value {
+            ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+            ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+            ScalarValue::Int32(Some(v)) | ScalarValue::Date32(Some(v)) => {
+                Some(i128::from(*v))
+            }
+            ScalarValue::Int64(Some(v)) | ScalarValue::Date64(Some(v)) => {
+                Some(i128::from(*v))
+            }
+            ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+            ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+            ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+            ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+            _ => None,
+        }
+    }
+    let (min, max) = (as_i128(min)?, as_i128(max)?);
+    max.checked_sub(min)
+        .and_then(|diff| diff.checked_add(1))
+        .and_then(|range| u128::try_from(range).ok())
+}
+
+/// When there are at least two row groups and their `[min, max]` ranges follow
+/// each other in ascending or descending order, returns the number of
+/// boundary values shared by adjacent row groups. Such row groups share no
+/// other values. This is the case for sorted or partitioned columns.
+///
+/// For example the ranges `[0, 10]`, `[10, 19]`, `[20, 30]` share one boundary
+/// value, and three row groups with the range `["x", "x"]` share two.
+fn disjoint_row_groups_shared_boundaries(
+    mins: &ArrayRef,
+    maxes: &ArrayRef,
+) -> Result<Option<usize>> {
+    let n = mins.len();
+    if n < 2 || mins.null_count() > 0 || maxes.null_count() > 0 {
+        return Ok(None);
+    }
+    let all_true = |result: &BooleanArray| result.true_count() == result.len();
+    let (head_mins, tail_mins) = (mins.slice(0, n - 1), mins.slice(1, n - 1));
+    let (head_maxes, tail_maxes) = (maxes.slice(0, n - 1), maxes.slice(1, n - 1));
+    for (lower_maxes, upper_mins) in
+        [(&head_maxes, &tail_mins), (&tail_maxes, &head_mins)]
+    {
+        if all_true(&lt_eq(lower_maxes, upper_mins)?) {
+            return Ok(Some(eq(lower_maxes, upper_mins)?.true_count()));
+        }
+    }
+    Ok(None)
+}
+
+/// Invert the size of a dictionary encoded column chunk to a distinct count.
+///
+/// The uncompressed chunk size is modeled as the dictionary page plus the
+/// bit packed indexes of the data pages:
+///
+/// `size = ndv * value_length + non_null * ceil(log2(ndv)) / 8`
+///
+/// where `non_null` is the number of non-null values in the chunk and
+/// `value_length` is the mean encoded length of a value in bytes. The equation
+/// is solved with Newton-Raphson. The size is not smooth because of the
+/// `ceil`, so if Newton-Raphson does not reach the tolerance the result is
+/// found by bisection, which works because the size grows with `ndv`.
+/// The result is in `[1, non_null]`.
+fn invert_dictionary_size(size: f64, non_null: f64, value_length: f64) -> f64 {
+    let residual = |ndv: f64| {
+        ndv * value_length + non_null * ndv.log2().ceil().max(0.0) / 8.0 - size
+    };
+    let upper = non_null.max(1.0);
+
+    let mut ndv = (size / value_length).clamp(1.0, upper);
+    for _ in 0..NEWTON_MAX_ITERATIONS {
+        let value = residual(ndv);
+        if value.abs() < NEWTON_TOLERANCE {
+            return ndv;
+        }
+        let slope = value_length + non_null / (8.0 * ndv * LN_2);
+        ndv = (ndv - value / slope).clamp(1.0, upper);
+    }
+
+    if residual(1.0) >= 0.0 {
+        return 1.0;
+    }
+    if residual(upper) <= 0.0 {
+        return upper;
+    }
+    let (mut low, mut high) = (1.0, upper);
+    for _ in 0..100 {
+        let mid = f64::midpoint(low, high);
+        if residual(mid) < 0.0 {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    high
+}
+
+/// Invert the coupon collector model to a distinct count.
+///
+/// Drawing `draws` values from `ndv` equally likely distinct values yields in
+/// expectation `ndv * (1 - exp(-draws / ndv))` distinct values. Given the
+/// observed number of distinct values `observed`, solve for `ndv` with
+/// Newton-Raphson, starting at `observed`. The function is concave and
+/// increasing, so the iteration approaches the root from below.
+///
+/// Returns `None` when there is no finite solution, which happens when
+/// `observed >= draws` or `draws < 2`.
+fn invert_coupon_collector(observed: usize, draws: usize) -> Option<f64> {
+    if draws < 2 || observed == 0 || observed >= draws {
+        return None;
+    }
+    let (m, n) = (observed as f64, draws as f64);
+    let mut ndv = m;
+    for _ in 0..NEWTON_MAX_ITERATIONS * 4 {
+        let decay = (-n / ndv).exp();
+        let value = ndv * (1.0 - decay) - m;
+        let slope = 1.0 - decay * (1.0 + n / ndv);
+        if slope <= 0.0 {
+            return None;
+        }
+        let next = ndv - value / slope;
+        if !next.is_finite() {
+            return None;
+        }
+        if (next - ndv).abs() < NEWTON_TOLERANCE {
+            return Some(next);
+        }
+        ndv = next;
+    }
+    Some(ndv)
 }
 
 /// Compute the Arrow in-memory size for a single column
@@ -1398,14 +1851,310 @@ mod tests {
 
     mod statistics_tests {
         use super::*;
+        use arrow::array::{Int32Array, Int64Array, StringArray};
         use arrow::datatypes::Field;
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::ColumnChunkMetaData;
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::basic::{Compression, GzipLevel};
+        use parquet::file::properties::WriterProperties;
         use parquet::file::reader::{FileReader, SerializedFileReader};
         use parquet::file::statistics::Statistics as ParquetStatistics;
-        use parquet::schema::types::Type as SchemaType;
+        use parquet::schema::types::{ColumnPath, Type as SchemaType};
         use std::fs::File;
         use std::path::PathBuf;
+
+        #[test]
+        fn test_invert_coupon_collector() {
+            // 100 equally likely values drawn 50 times give about 39.35 distinct values
+            let expected = 100.0 * (1.0 - (-0.5_f64).exp());
+            assert!((expected - 39.35).abs() < 0.01);
+            let ndv = invert_coupon_collector(39, 50).unwrap();
+            assert!((ndv - 99.0).abs() < 5.0, "unexpected estimate {ndv}");
+
+            // The expected count of the model is recovered exactly
+            let ndv = invert_coupon_collector(5, 10).unwrap();
+            let forward = ndv * (1.0 - (-10.0 / ndv).exp());
+            assert!((forward - 5.0).abs() < 1e-4);
+
+            // No finite solution when every draw is distinct, or with fewer than 2 draws
+            assert_eq!(invert_coupon_collector(50, 50), None);
+            assert_eq!(invert_coupon_collector(60, 50), None);
+            assert_eq!(invert_coupon_collector(1, 1), None);
+            assert_eq!(invert_coupon_collector(0, 10), None);
+
+            // Almost every draw is distinct, the solution is large but finite
+            let ndv = invert_coupon_collector(49, 50).unwrap();
+            assert!(ndv.is_finite() && ndv > 100.0);
+        }
+
+        #[test]
+        fn test_invert_dictionary_size() {
+            for (ndv, non_null, value_length) in [
+                (1.0, 1000.0, 4.0),
+                (20.0, 10_000.0, 12.0),
+                (256.0, 10_000.0, 8.0),
+                (1000.0, 100_000.0, 4.0),
+                (5000.0, 100_000.0, 16.0),
+            ] {
+                let size =
+                    ndv * value_length + non_null * f64::ceil(f64::log2(ndv)) / 8.0;
+                let estimate = invert_dictionary_size(size, non_null, value_length);
+                assert!(
+                    (estimate - ndv).abs() <= ndv * 0.01,
+                    "ndv {ndv}: estimate {estimate}"
+                );
+            }
+
+            // The estimate stays within [1, non_null]
+            assert_eq!(invert_dictionary_size(1.0, 100.0, 8.0), 1.0);
+            assert_eq!(invert_dictionary_size(1e9, 100.0, 8.0), 100.0);
+        }
+
+        #[test]
+        fn test_range_fill_floor() {
+            // 12 months in 73049 rows, small range: no dictionary check
+            let months = range_fill_floor(12, 73_049, 0).unwrap();
+            assert!((months - 12.0).abs() < 1e-6, "{months}");
+            // 10 rows per value with a dense dictionary: 1 - exp(-10) of the range
+            let dense = range_fill_floor(100, 1000, 150).unwrap();
+            assert!((dense - 100.0 * (1.0 - (-10.0_f64).exp())).abs() < 1e-9);
+            // Fewer rows per value: no floor
+            assert_eq!(range_fill_floor(100, 999, 150), None);
+            assert_eq!(range_fill_floor(1 << 40, 1_000_000, 1 << 30), None);
+            // Domain with gaps (TPC-DS cd_purchase_estimate: 20 values, range
+            // 9501, 70 dictionary bytes): no floor
+            assert_eq!(range_fill_floor(9501, 1_920_800, 70), None);
+            // Dense domain (TPC-DS d_year: range 201, 310 dictionary bytes)
+            assert!(range_fill_floor(201, 73_049, 310).is_some());
+        }
+
+        #[test]
+        fn test_dictionary_page_overhead_bytes() {
+            assert_eq!(
+                dictionary_page_overhead_bytes(Compression::UNCOMPRESSED),
+                32
+            );
+            assert_eq!(
+                dictionary_page_overhead_bytes(Compression::GZIP(GzipLevel::default())),
+                52
+            );
+            assert_eq!(dictionary_page_overhead_bytes(Compression::SNAPPY), 40);
+        }
+
+        #[test]
+        fn test_integer_value_range() {
+            assert_eq!(
+                integer_value_range(
+                    &ScalarValue::Int32(Some(-5)),
+                    &ScalarValue::Int32(Some(4))
+                ),
+                Some(10)
+            );
+            assert_eq!(
+                integer_value_range(
+                    &ScalarValue::Int64(Some(i64::MIN)),
+                    &ScalarValue::Int64(Some(i64::MAX))
+                ),
+                Some(1_u128 << 64)
+            );
+            assert_eq!(
+                integer_value_range(
+                    &ScalarValue::Float64(Some(1.0)),
+                    &ScalarValue::Float64(Some(2.0))
+                ),
+                None
+            );
+            assert_eq!(
+                integer_value_range(
+                    &ScalarValue::Int32(None),
+                    &ScalarValue::Int32(Some(1))
+                ),
+                None
+            );
+        }
+
+        /// Write a Parquet file without `distinct_count` statistics: 3 row groups of
+        /// 5000 rows with
+        /// - category: 20 distinct strings present in every row group
+        /// - sorted: unique, increasing integers, 15000 distinct values
+        /// - plain: unique, unordered integers, without dictionary encoding
+        /// - clustered: 1250 distinct integers, each repeated in 12 consecutive
+        ///   rows, so the dictionary indexes are run length encoded
+        /// - unique_strings: unique, unordered strings
+        /// - constant: a single string value (no value range cap), GZIP compressed
+        fn write_estimation_test_file() -> ParquetMetaData {
+            let rows = 15_000_i64;
+            let category: StringArray = (0..rows)
+                .map(|i| Some(format!("category_{:02}", (i * 7) % 20)))
+                .collect();
+            let sorted: Int64Array = (0..rows).collect();
+            let plain: Int64Array = (0..rows).map(|i| (i * 7919) % rows).collect();
+            let clustered: Int64Array =
+                (0..rows).map(|i| ((i / 12) * 7919) % 1250).collect();
+            let unique_strings: StringArray = (0..rows)
+                .map(|i| Some(format!("value_{:05}", (i * 7919) % rows)))
+                .collect();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("category", DataType::Utf8, false),
+                Field::new("sorted", DataType::Int64, false),
+                Field::new("plain", DataType::Int64, false),
+                Field::new("clustered", DataType::Int64, false),
+                Field::new("unique_strings", DataType::Utf8, false),
+                Field::new("constant", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(category),
+                    Arc::new(sorted),
+                    Arc::new(plain),
+                    Arc::new(clustered),
+                    Arc::new(unique_strings),
+                    Arc::new(StringArray::from(vec!["x"; rows as usize])),
+                ],
+            )
+            .unwrap();
+
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(5000))
+                .set_column_dictionary_enabled(ColumnPath::from("plain"), false)
+                .set_column_compression(
+                    ColumnPath::from("constant"),
+                    Compression::GZIP(GzipLevel::default()),
+                )
+                .build();
+            let mut buffer = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut buffer, schema, Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))
+                .unwrap()
+                .metadata()
+                .as_ref()
+                .clone()
+        }
+
+        #[test]
+        fn test_estimate_distinct_count_from_real_parquet_file() {
+            let metadata = write_estimation_test_file();
+            assert_eq!(metadata.num_row_groups(), 3);
+            let schema = Arc::new(
+                parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+                    .unwrap(),
+            );
+
+            // Flag off: no written distinct count means Absent
+            let stats =
+                DFParquetMetadata::statistics_from_parquet_metadata(&metadata, &schema)
+                    .unwrap();
+            assert_eq!(stats.column_statistics[0].distinct_count, Precision::Absent);
+            assert_eq!(stats.column_statistics[1].distinct_count, Precision::Absent);
+
+            let stats = DFParquetMetadata::statistics_from_parquet_metadata_with_options(
+                &metadata, &schema, true,
+            )
+            .unwrap();
+
+            // Truth is 20, the accepted band is [10, 40]
+            let Precision::Inexact(category) = stats.column_statistics[0].distinct_count
+            else {
+                panic!("expected an inexact estimate");
+            };
+            assert!(
+                (10..=40).contains(&category),
+                "category estimate {category}"
+            );
+
+            // Truth is 15000. The row groups do not overlap, so their counts are
+            // added. The accepted band is [12000, 15000]
+            let Precision::Inexact(sorted) = stats.column_statistics[1].distinct_count
+            else {
+                panic!("expected an inexact estimate");
+            };
+            assert!(
+                (12_000..=15_000).contains(&sorted),
+                "sorted estimate {sorted}"
+            );
+
+            // No dictionary, and every row group has a different minimum, so
+            // neither signal applies
+            assert_eq!(stats.column_statistics[2].distinct_count, Precision::Absent);
+
+            // Truth is 1250, about 417 per row group, in overlapping ranges, so the
+            // maximum over row groups is used. The dictionary page size bound keeps
+            // the run length encoded indexes from collapsing the estimate. The
+            // accepted band is [350, 1250]
+            let Precision::Inexact(clustered) = stats.column_statistics[3].distinct_count
+            else {
+                panic!("expected an inexact estimate");
+            };
+            assert!(
+                (350..=1250).contains(&clustered),
+                "clustered estimate {clustered}"
+            );
+
+            // Truth is 15000. Every row group is nearly unique, so the counts are
+            // added. The accepted band is [12000, 15000]
+            let Precision::Inexact(unique) = stats.column_statistics[4].distinct_count
+            else {
+                panic!("expected an inexact estimate");
+            };
+            assert!(
+                (12_000..=15_000).contains(&unique),
+                "unique_strings estimate {unique}"
+            );
+
+            // Truth is 1. The fixed dictionary page overhead must not inflate the
+            // dictionary page size bound. The accepted band is [1, 2]
+            let Precision::Inexact(constant) = stats.column_statistics[5].distinct_count
+            else {
+                panic!("expected an inexact estimate");
+            };
+            assert!((1..=2).contains(&constant), "constant estimate {constant}");
+        }
+
+        #[test]
+        fn test_disjoint_row_groups_shared_boundaries() {
+            let ints = |values: Vec<Option<i32>>| -> ArrayRef {
+                Arc::new(Int32Array::from(values))
+            };
+            let shared = |mins: ArrayRef, maxes: ArrayRef| {
+                disjoint_row_groups_shared_boundaries(&mins, &maxes).unwrap()
+            };
+            // Ascending, sharing the boundary value 10
+            assert_eq!(
+                shared(
+                    ints(vec![Some(0), Some(10), Some(20)]),
+                    ints(vec![Some(10), Some(19), Some(30)]),
+                ),
+                Some(1)
+            );
+            // Descending, no shared boundary
+            assert_eq!(
+                shared(
+                    ints(vec![Some(20), Some(0)]),
+                    ints(vec![Some(30), Some(10)])
+                ),
+                Some(0)
+            );
+            // The same single value in every row group
+            let constant: ArrayRef = Arc::new(StringArray::from(vec!["x"; 3]));
+            assert_eq!(shared(Arc::clone(&constant), constant), Some(2));
+            // Overlapping
+            assert_eq!(
+                shared(ints(vec![Some(0), Some(5)]), ints(vec![Some(10), Some(15)])),
+                None
+            );
+            // Single row group or missing statistics
+            assert_eq!(shared(ints(vec![Some(0)]), ints(vec![Some(1)])), None);
+            assert_eq!(
+                shared(ints(vec![Some(0), None]), ints(vec![Some(1), Some(5)])),
+                None
+            );
+        }
 
         fn create_schema_descr(num_columns: usize) -> Arc<SchemaDescriptor> {
             let fields: Vec<Arc<SchemaType>> = (0..num_columns)

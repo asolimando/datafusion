@@ -391,6 +391,8 @@ impl TryFrom<&ParquetOptionsProto> for ParquetOptions {
                 })
                 .transpose()?,
             enable_rle_to_dictionary: proto.enable_rle_to_dictionary,
+            estimate_distinct_count_from_metadata: proto
+                .estimate_distinct_count_from_metadata,
             dictionary_enabled: proto.dictionary_enabled_opt.as_ref().map(|opt| {
                 match opt {
                     parquet_options::DictionaryEnabledOpt::DictionaryEnabled(
