@@ -428,6 +428,13 @@ impl FileFormat for ParquetFormat {
         Ok(Arc::new(schema))
     }
 
+    fn statistics_options_fingerprint(&self) -> Option<String> {
+        self.options
+            .global
+            .estimate_distinct_count_from_metadata
+            .then(|| "estimate_distinct_count_from_metadata".to_string())
+    }
+
     async fn infer_stats(
         &self,
         state: &dyn Session,

@@ -139,6 +139,19 @@ pub trait FileFormat: Any + Send + Sync + fmt::Debug {
         object: &ObjectMeta,
     ) -> Result<Statistics>;
 
+    /// A string that identifies the options of this format that change what
+    /// [`Self::infer_stats`] returns, or `None` when they are all at their
+    /// defaults.
+    ///
+    /// Cached file statistics are only reused by a table whose format returns
+    /// the same value, so tables or sessions that read the same files with
+    /// different options do not see each other's statistics.
+    ///
+    /// The default implementation returns `None`.
+    fn statistics_options_fingerprint(&self) -> Option<String> {
+        None
+    }
+
     /// Infer the ordering (sort order) for the provided object from file metadata.
     ///
     /// Returns `Ok(None)` if the file format does not support ordering inference

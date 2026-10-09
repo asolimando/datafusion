@@ -309,6 +309,70 @@ DROP TABLE cast_stats_ints_overflow;
 statement ok
 SET datafusion.execution.target_partitions = 4;
 
+######
+# Distinct counts estimated from Parquet metadata
+######
+
+statement ok
+set datafusion.explain.physical_plan_only = true;
+
+statement ok
+set datafusion.explain.show_statistics = true;
+
+query I
+COPY (
+    SELECT v AS id, v % 10 AS cat, arrow_cast(v * 1.5, 'Float64') AS f
+    FROM generate_series(0, 9999) AS t(v)
+)
+TO 'test_files/scratch/parquet_statistics/ndv_table.parquet'
+STORED AS PARQUET;
+----
+10000
+
+# Off by default: DataFusion does not write distinct counts
+statement ok
+CREATE EXTERNAL TABLE ndv_table
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_statistics/ndv_table.parquet';
+
+query TT
+EXPLAIN SELECT id, cat FROM ndv_table;
+----
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/ndv_table.parquet]]}, projection=[id, cat], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, statistics=[Rows=Exact(10000), Bytes=Exact(160000), [(Col[0]: Min=Exact(Int64(0)) Max=Exact(Int64(9999)) Null=Exact(0) ScanBytes=Exact(80000)),(Col[1]: Min=Exact(Int64(0)) Max=Exact(Int64(9)) Null=Exact(0) ScanBytes=Exact(80000))]]
+
+statement ok
+DROP TABLE ndv_table;
+
+statement ok
+SET datafusion.execution.parquet.estimate_distinct_count_from_metadata = true;
+
+# Recreate the table to pick up the setting. Columns without a written distinct
+# count get an inexact estimate
+statement ok
+CREATE EXTERNAL TABLE ndv_table
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_statistics/ndv_table.parquet';
+
+query TT
+EXPLAIN SELECT id, cat FROM ndv_table;
+----
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/ndv_table.parquet]]}, projection=[id, cat], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, statistics=[Rows=Exact(10000), Bytes=Exact(160000), [(Col[0]: Min=Exact(Int64(0)) Max=Exact(Int64(9999)) Null=Exact(0) Distinct=Inexact(10000) ScanBytes=Exact(80000)),(Col[1]: Min=Exact(Int64(0)) Max=Exact(Int64(9)) Null=Exact(0) Distinct=Inexact(10) ScanBytes=Exact(80000))]]
+
+# The setting is read when the table is created
+statement ok
+SET datafusion.execution.parquet.estimate_distinct_count_from_metadata = false;
+
+query TT
+EXPLAIN SELECT id, cat FROM ndv_table;
+----
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_statistics/ndv_table.parquet]]}, projection=[id, cat], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, statistics=[Rows=Exact(10000), Bytes=Exact(160000), [(Col[0]: Min=Exact(Int64(0)) Max=Exact(Int64(9999)) Null=Exact(0) Distinct=Inexact(10000) ScanBytes=Exact(80000)),(Col[1]: Min=Exact(Int64(0)) Max=Exact(Int64(9)) Null=Exact(0) Distinct=Inexact(10) ScanBytes=Exact(80000))]]
+
+statement ok
+DROP TABLE ndv_table;
+
+statement ok
+RESET datafusion.execution.parquet.estimate_distinct_count_from_metadata;
+
 # Config reset
 statement ok
 RESET datafusion.execution.collect_statistics;

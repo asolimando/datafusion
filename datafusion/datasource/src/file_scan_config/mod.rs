@@ -572,6 +572,9 @@ impl FileScanConfigBuilder {
 
 /// Records that a key column holds one distinct value per row, which no file format
 /// stores. Single-column keys only: a composite key says nothing about its columns.
+///
+/// The declared key replaces an inexact count, e.g. one estimated from file metadata,
+/// and only an exact count is kept.
 fn add_key_distinct_counts(constraints: &Constraints, statistics: &mut Statistics) {
     let num_rows = statistics.num_rows;
     for constraint in constraints.iter() {
@@ -582,7 +585,7 @@ fn add_key_distinct_counts(constraints: &Constraints, statistics: &mut Statistic
         let Some(column) = statistics.column_statistics.get_mut(index) else {
             continue;
         };
-        if column.distinct_count != Precision::Absent {
+        if column.distinct_count.is_exact() == Some(true) {
             continue;
         }
         // A NULL is not a distinct value. A primary key has none; a unique column may
@@ -2281,6 +2284,24 @@ mod tests {
             unique.column_statistics[2].distinct_count,
             Precision::Inexact(100)
         );
+
+        // The key replaces an inexact count, e.g. a Parquet metadata estimate, but
+        // keeps an exact one.
+        for (file_count, expected) in [
+            (Precision::Inexact(37), Precision::Exact(100)),
+            (Precision::Exact(100), Precision::Exact(100)),
+        ] {
+            let mut estimated = statistics.clone();
+            estimated.column_statistics[0].distinct_count = file_count;
+            let primary_key = config_with_constraints(
+                table_schema.clone(),
+                estimated,
+                vec![Constraint::PrimaryKey(vec![0])],
+                None,
+            )
+            .statistics();
+            assert_eq!(primary_key.column_statistics[0].distinct_count, expected);
+        }
 
         // A composite key leaves its columns alone: only the combination is unique.
         let composite = stats(vec![Constraint::PrimaryKey(vec![0, 1])]);

@@ -412,3 +412,66 @@ fn get_list_file_cache_size(state1: &SessionState) -> usize {
         .unwrap()
         .len()
 }
+
+/// Tables that read the same file with different statistics options must not
+/// share cached statistics, even with the same name and cache.
+#[tokio::test]
+async fn statistics_cache_respects_distinct_count_estimation() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use datafusion_common::config::TableParquetOptions;
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("values.parquet");
+    let batch = RecordBatch::try_from_iter(vec![(
+        "v",
+        Arc::new(Int64Array::from_iter_values((0..10_000).map(|i| i % 100))) as _,
+    )])
+    .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(&path).unwrap(), batch.schema(), None)
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let table_path = ListingTableUrl::parse(path.to_str().unwrap())
+        .unwrap()
+        .with_table_ref(TableReference::bare("values"));
+
+    let (cache, _, mut state) = get_cache_runtime_state();
+    state
+        .config_mut()
+        .options_mut()
+        .execution
+        .collect_statistics = true;
+    let distinct_count = |table: ListingTable| {
+        let state = state.clone();
+        async move {
+            let exec = table.scan(&state, None, &[], None).await.unwrap();
+            StatisticsContext::new()
+                .compute(exec.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .column_statistics[0]
+                .distinct_count
+        }
+    };
+
+    let default_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let mut parquet_options = TableParquetOptions::default();
+    parquet_options.global.estimate_distinct_count_from_metadata = true;
+    let estimate_options = ListingOptions::new(Arc::new(
+        ParquetFormat::default().with_options(parquet_options),
+    ));
+
+    let table =
+        get_listing_table(&table_path, Some(Arc::clone(&cache)), &default_options);
+    assert_eq!(distinct_count(table.await).await, Precision::Absent);
+    let table =
+        get_listing_table(&table_path, Some(Arc::clone(&cache)), &estimate_options);
+    let estimate = distinct_count(table.await).await;
+    assert!(
+        matches!(estimate, Precision::Inexact(n) if (90..=110).contains(&n)),
+        "{estimate:?}"
+    );
+    let table = get_listing_table(&table_path, Some(cache), &default_options);
+    assert_eq!(distinct_count(table.await).await, Precision::Absent);
+}

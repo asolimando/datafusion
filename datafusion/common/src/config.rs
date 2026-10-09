@@ -1440,8 +1440,10 @@ config_namespace! {
         /// (reading) If true and the file does not provide `distinct_count`
         /// statistics, estimate the number of distinct values of each column
         /// from dictionary page sizes and row group min/max statistics.
-        /// The estimate is always inexact.
-        /// See <https://arxiv.org/abs/2603.24606>
+        /// Columns that are not dictionary encoded get no estimate. The
+        /// estimate is always inexact. Like other format options, the setting
+        /// is read when a table is created, so changing it does not affect
+        /// existing tables. See <https://arxiv.org/abs/2603.24606>
         pub estimate_distinct_count_from_metadata: bool, default = false
 
         /// (reading) Which byte range of a split file reads each row group.
