@@ -595,7 +595,11 @@ fn add_key_distinct_counts(constraints: &Constraints, statistics: &mut Statistic
             (_, Precision::Absent) => Precision::Inexact(0),
             (_, nulls) => nulls,
         };
-        column.distinct_count = num_rows.sub(&nulls);
+        // Without a row count the key says nothing, so keep any estimate
+        let key_count = num_rows.sub(&nulls);
+        if key_count != Precision::Absent {
+            column.distinct_count = key_count;
+        }
     }
 }
 
@@ -2302,6 +2306,22 @@ mod tests {
             .statistics();
             assert_eq!(primary_key.column_statistics[0].distinct_count, expected);
         }
+
+        // Without a row count the key cannot replace an estimate.
+        let mut no_rows = statistics.clone();
+        no_rows.num_rows = Precision::Absent;
+        no_rows.column_statistics[0].distinct_count = Precision::Inexact(37);
+        let primary_key = config_with_constraints(
+            table_schema.clone(),
+            no_rows,
+            vec![Constraint::PrimaryKey(vec![0])],
+            None,
+        )
+        .statistics();
+        assert_eq!(
+            primary_key.column_statistics[0].distinct_count,
+            Precision::Inexact(37)
+        );
 
         // A composite key leaves its columns alone: only the combination is unique.
         let composite = stats(vec![Constraint::PrimaryKey(vec![0, 1])]);

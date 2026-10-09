@@ -22,7 +22,7 @@ use crate::file_format::ObjectStoreFetch;
 use crate::{Int96Coercer, apply_file_schema_type_coercions};
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array};
 use arrow::compute::kernels::cmp::{eq, lt_eq};
-use arrow::compute::{and, sort_to_indices, sum, take};
+use arrow::compute::{SortColumn, and, lexsort_to_indices, sum, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
@@ -1236,7 +1236,10 @@ fn is_dictionary_encoding(encoding: Encoding) -> bool {
 ///   chunk counts as fully dictionary encoded
 ///
 /// Any other value encoding next to a dictionary encoding, e.g. the
-/// `DELTA_BYTE_ARRAY` fallback of version 2 pages, is a fallback.
+/// `DELTA_BYTE_ARRAY` fallback of version 2 pages, is a fallback. Writers that
+/// list `PLAIN` next to `PLAIN_DICTIONARY` without a fallback and without page
+/// encoding statistics, as some old parquet-cpp versions may, only get the
+/// dictionary page size bound, an underestimate.
 ///
 /// `dictionary_page_offset` is not used: parquet-mr before 1.12 never sets it.
 fn chunk_encoding(chunk: &ColumnChunkMetaData) -> ChunkEncoding {
@@ -1322,9 +1325,10 @@ fn chunk_null_count(chunk: &ColumnChunkMetaData) -> Option<u64> {
 /// Estimated uncompressed size of the definition levels of `chunk`.
 ///
 /// Levels are run length encoded, so a column without NULLs has almost none,
-/// while each NULL that interrupts a run of non-null values costs about the
-/// level bit width plus [`DEFINITION_LEVEL_BYTES_PER_NULL`]. The size never
-/// exceeds bit packing every level.
+/// while each NULL that interrupts a run of non-null values forces a bit packed
+/// group of 8 levels, which takes the level bit width in bytes, plus
+/// [`DEFINITION_LEVEL_BYTES_PER_NULL`] of run headers. The size never exceeds
+/// bit packing every level.
 fn definition_level_bytes(chunk: &ColumnChunkMetaData, nulls: u64, values: u64) -> f64 {
     let max_level = chunk.column_descr().max_def_level();
     if max_level <= 0 || nulls == 0 {
@@ -1352,8 +1356,8 @@ fn definition_level_bytes(chunk: &ColumnChunkMetaData, nulls: u64, values: u64) 
 ///   with many more distinct values than the dictionary page holds.
 ///
 /// A row group that has values but neither a written count nor a dictionary
-/// makes the result `None`: the remaining signals cannot tell 4 from 100 000
-/// distinct values.
+/// leaves only the largest written count, a lower bound, or else `None`: the
+/// remaining signals cannot tell 4 from 100 000 distinct values.
 ///
 /// The paper does not say how to combine row groups. When
 /// [`ColumnFacts::shared_boundaries`] is set the row groups share no values
@@ -1404,7 +1408,11 @@ fn estimate_distinct_count_from_metadata(
             row_groups_with_stats += 1;
             distinct_mins.insert(min);
             distinct_maxs.insert(max);
-            exact_extrema &= stats.min_is_exact() && stats.max_is_exact();
+            // Only byte array statistics are truncated
+            exact_extrema &= !matches!(
+                physical_type,
+                PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY
+            ) || (stats.min_is_exact() && stats.max_is_exact());
         }
     }
     // Distinct minimums are distinct values, as are distinct maximums. A
@@ -1429,6 +1437,10 @@ fn estimate_distinct_count_from_metadata(
     // Largest stored dictionary of a single row group
     let mut max_dictionary_bytes: Option<i64> = None;
     let mut non_null_values = 0_u64;
+    // Largest written distinct count, a lower bound of the result
+    let mut max_written: Option<u64> = None;
+    // A row group with values but neither a written count nor a dictionary
+    let mut missing_dictionary = false;
     for chunk in &chunks {
         let values = u64::try_from(chunk.num_values()).ok()?;
         let nulls = chunk_null_count(chunk);
@@ -1444,6 +1456,7 @@ fn estimate_distinct_count_from_metadata(
             .statistics()
             .and_then(|stats| stats.distinct_count_opt())
         {
+            max_written = Some(max_written.unwrap_or(0).max(written));
             let non_null = non_null as f64;
             row_group_estimates.push(((written as f64).min(non_null), non_null));
             continue;
@@ -1451,7 +1464,8 @@ fn estimate_distinct_count_from_metadata(
 
         let encoding = chunk_encoding(chunk);
         if encoding == ChunkEncoding::NotDictionary {
-            return None;
+            missing_dictionary = true;
+            continue;
         }
         let value_length = match physical_type {
             PhysicalType::BYTE_ARRAY => {
@@ -1508,6 +1522,12 @@ fn estimate_distinct_count_from_metadata(
     if non_null_values == 0 {
         // Only NULLs: no distinct value
         return Some(0);
+    }
+    if missing_dictionary {
+        // Only the written counts are known, and they are a lower bound
+        return max_written
+            .map(|written| written.min(non_null_values))
+            .and_then(|written| usize::try_from(written).ok());
     }
     if row_group_estimates.is_empty() {
         return None;
@@ -1682,7 +1702,21 @@ fn disjoint_row_groups_shared_boundaries(
     if mins.null_count() > 0 || maxes.null_count() > 0 {
         return Ok(None);
     }
-    let order = sort_to_indices(&mins, None, None)?;
+    // Ties on the minimum are ordered by maximum, so the file order does not
+    // matter
+    let order = lexsort_to_indices(
+        &[
+            SortColumn {
+                values: Arc::clone(&mins),
+                options: None,
+            },
+            SortColumn {
+                values: Arc::clone(&maxes),
+                options: None,
+            },
+        ],
+        None,
+    )?;
     let (mins, maxes) = (take(&mins, &order, None)?, take(&maxes, &order, None)?);
     let (lower_maxes, upper_mins) = (maxes.slice(0, n - 1), mins.slice(1, n - 1));
     if lt_eq(&lower_maxes, &upper_mins)?.true_count() != n - 1 {
@@ -1768,18 +1802,22 @@ fn compute_arrow_column_size(
     num_rows: usize,
 ) -> Precision<usize> {
     // For primitive types with known fixed size, compute exact size
+    // Footer values may be corrupt, so overflow gives an unknown size
     if let Some(byte_width) = data_type.primitive_width() {
-        return Precision::Exact(byte_width * num_rows);
+        return byte_width
+            .checked_mul(num_rows)
+            .map_or(Precision::Absent, Precision::Exact);
     }
 
     // Use the uncompressed Parquet size as an estimate for other types
     if let Some(parquet_idx) = parquet_idx {
-        let uncompressed_bytes: i64 = row_groups_metadata
+        let uncompressed_bytes = row_groups_metadata
             .iter()
             .filter_map(|rg| rg.columns().get(parquet_idx))
-            .map(|col| col.uncompressed_size())
-            .sum();
-        return Precision::Inexact(uncompressed_bytes as usize);
+            .try_fold(0_usize, |total, col| {
+                total.checked_add(usize::try_from(col.uncompressed_size()).ok()?)
+            });
+        return uncompressed_bytes.map_or(Precision::Absent, Precision::Inexact);
     }
 
     // Otherwise, we cannot determine the size
@@ -2342,12 +2380,12 @@ mod tests {
                 "sorted estimate {sorted}"
             );
 
-            // No dictionary, and every row group has a different minimum, so
-            // neither signal applies
+            // Not dictionary encoded
             assert_eq!(stats.column_statistics[2].distinct_count, Precision::Absent);
 
             // Truth is 1250, about 417 per row group, in overlapping ranges, so the
-            // maximum over row groups is used. The dictionary page size bound keeps
+            // row groups are modeled as samples of the same values, which gives
+            // about the per row group count. The dictionary page size bound keeps
             // the run length encoded indexes from collapsing the estimate. The
             // accepted band is [350, 1250]
             let Precision::Inexact(clustered) = stats.column_statistics[3].distinct_count
@@ -2410,6 +2448,15 @@ mod tests {
             assert_eq!(
                 shared(ints(vec![Some(0), Some(5)]), ints(vec![Some(10), Some(15)])),
                 None
+            );
+            // Tied minimums: the file order does not matter
+            assert_eq!(
+                shared(ints(vec![Some(5), Some(5)]), ints(vec![Some(9), Some(5)])),
+                Some(1)
+            );
+            assert_eq!(
+                shared(ints(vec![Some(5), Some(5)]), ints(vec![Some(5), Some(9)])),
+                Some(1)
             );
             // Single row group or missing statistics
             assert_eq!(shared(ints(vec![Some(0)]), ints(vec![Some(1)])), None);
@@ -2724,16 +2771,24 @@ mod tests {
         }
 
         /// A written distinct count is used for its row group, even when too few
-        /// row groups have one for the file level count.
+        /// row groups have one for the file level count, and stays a lower bound
+        /// when other row groups have no dictionary.
         #[test]
         fn test_estimate_uses_written_distinct_counts() {
-            let mut written = ChunkSpec::dictionary(10_000, 5000, 0, 100_000);
+            // The size and dictionary of this chunk say 1000 values
+            let mut written = ChunkSpec::dictionary(10_000, 1000, 0, 100_000);
             written.distinct = Some(5000);
             let other = ChunkSpec::dictionary(10_000, 1000, 0, 100_000);
-            let chunks = [written, other.clone(), other.clone(), other];
+            let chunks = [written.clone(), other.clone(), other.clone(), other];
             let estimate = inexact(estimate_int64(&chunks));
             // 5000 distinct values in 10 000 rows sample about 6275 values
             assert!((5000..=6300).contains(&estimate), "{estimate}");
+
+            let plain = ChunkSpec::plain(10_000, 0, 100_000);
+            let chunks = [written, plain.clone(), plain];
+            assert_eq!(inexact(estimate_int64(&chunks)), 5000);
+            let chunks = [ChunkSpec::plain(10_000, 0, 100_000)];
+            assert_eq!(estimate_int64(&chunks), Precision::Absent);
         }
 
         /// NULLs are only subtracted where they are known, and an estimate is
@@ -2803,7 +2858,7 @@ mod tests {
                 None
             );
             let reversed = ChunkSpec::dictionary(10_000, 1000, 5, 4);
-            assert!(inexact(estimate_int64(&[reversed])) > 0);
+            assert_eq!(inexact(estimate_int64(&[reversed])), 1000);
         }
 
         /// 1000 distinct integers with 0, 50% and 90% NULLs: the definition
@@ -2812,10 +2867,15 @@ mod tests {
         fn test_estimate_nullable_column() {
             let rows = 100_000_i64;
             let column = |kept_tenths: Option<i64>| -> ArrayRef {
-                Arc::new(Int64Array::from_iter((0..rows).map(|i| {
-                    let null = kept_tenths.is_some_and(|keep| (i / 7) % 10 >= keep);
-                    (!null).then_some(shuffled(i, rows) % 1000)
-                })))
+                Arc::new(
+                    (0..rows)
+                        .map(|i| {
+                            let null =
+                                kept_tenths.is_some_and(|keep| (i / 7) % 10 >= keep);
+                            (!null).then_some(shuffled(i, rows) % 1000)
+                        })
+                        .collect::<Int64Array>(),
+                )
             };
             let batch = RecordBatch::try_from_iter(vec![
                 ("none", column(None)),
