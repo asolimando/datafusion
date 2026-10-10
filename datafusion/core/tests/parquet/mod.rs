@@ -53,6 +53,7 @@ mod expr_adapter;
 mod external_access_plan;
 mod file_statistics;
 mod filter_pushdown;
+mod ndv_accuracy;
 mod ordering;
 mod page_pruning;
 mod row_group_pruning;
