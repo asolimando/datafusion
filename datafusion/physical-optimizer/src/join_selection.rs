@@ -70,16 +70,18 @@ fn get_stats(
 }
 
 // TODO: We need some performance test for Right Semi/Right Join swap to Left Semi/Left Join in case that the right side is smaller but not much smaller.
-// TODO: In PrestoSQL, the optimizer flips join sides only if one side is much smaller than the other by more than SIZE_DIFFERENCE_THRESHOLD times, by default is 8 times.
 /// Checks whether join inputs should be swapped using available statistics.
 ///
 /// It follows these steps:
 /// 1. If a [`datafusion_physical_plan::operator_statistics::StatisticsRegistry`] is
 ///    provided, use it for cross-operator estimates
 ///    (e.g., intermediate join outputs that would otherwise have `Absent` statistics).
-/// 2. Compare the in-memory sizes of both sides, and place the smaller side on
-///    the left (build) side.
-/// 3. If in-memory byte sizes are unavailable, fall back to row counts.
+/// 2. Compare the row counts of both sides, and place the side with fewer rows
+///    on the left (build) side: building and probing a hash table costs per
+///    row, and the dynamic filter from the build side is more selective with
+///    fewer rows. Whether the build side fits in memory is decided by the
+///    collect thresholds, on bytes.
+/// 3. If the row counts are equal or unavailable, compare the in-memory sizes.
 /// 4. Do not reorder the join if neither statistic is available, or if
 ///    `datafusion.optimizer.join_reordering` is disabled.
 ///
@@ -97,16 +99,16 @@ pub(crate) fn should_swap_join_order(
     let left_stats = get_stats(left, context)?;
     let right_stats = get_stats(right, context)?;
 
-    // First compare total_byte_size, then fall back to num_rows if byte
-    // sizes are unavailable.
+    // First compare num_rows, then total_byte_size when the row counts are
+    // equal or unavailable.
     match (
-        left_stats.total_byte_size.get_value(),
-        right_stats.total_byte_size.get_value(),
+        left_stats.num_rows.get_value(),
+        right_stats.num_rows.get_value(),
     ) {
-        (Some(l), Some(r)) => Ok(l > r),
+        (Some(l), Some(r)) if l != r => Ok(l > r),
         _ => match (
-            left_stats.num_rows.get_value(),
-            right_stats.num_rows.get_value(),
+            left_stats.total_byte_size.get_value(),
+            right_stats.total_byte_size.get_value(),
         ) {
             (Some(l), Some(r)) => Ok(l > r),
             _ => Ok(false),

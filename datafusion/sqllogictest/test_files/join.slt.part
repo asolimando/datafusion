@@ -1446,7 +1446,7 @@ logical_plan
 02)--TableScan: t0 projection=[v0, v1]
 03)--TableScan: t1 projection=[v0, v1]
 physical_plan
-01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(v0@0, v0@0)]
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(v0@0, v0@0)], projection=[v0@2, v1@3, v0@0, v1@1]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 03)--DataSourceExec: partitions=1, partition_sizes=[1]
 

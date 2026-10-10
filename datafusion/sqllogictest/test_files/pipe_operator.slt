@@ -174,7 +174,7 @@ query TII rowsort
 apples 2 9
 
 # JOIN pipe
-query TII
+query TII rowsort
 (
   SELECT 'apples' AS item, 2 AS sales
   UNION ALL
