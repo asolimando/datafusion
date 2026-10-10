@@ -1205,9 +1205,9 @@ const DICTIONARY_PAGE_SIZE_LIMIT: f64 = 1_048_576.0;
 /// Bytes a NULL costs in the run length encoded definition levels on top of
 /// the level bit width: it ends the run of non-null levels (a header byte and
 /// a value byte) and forces a bit packed group (a header byte). Encoders that
-/// return to run length encoding only after 8 equal levels spend up to twice
-/// that on an isolated NULL, which errs the estimate high by at most
-/// `nulls * 5 / value_length`.
+/// return to run length encoding only after 8 equal levels were measured at
+/// up to 9 bytes per isolated NULL, 5 more than modeled, which errs the
+/// estimate high by at most `nulls * 5 / value_length`.
 const DEFINITION_LEVEL_BYTES_PER_NULL: f64 = 3.0;
 
 /// How the data pages of a column chunk are encoded.
@@ -1494,8 +1494,9 @@ enum RowGroupEstimate {
 ///   bound is used.
 ///
 /// A row group that has values but neither a written count nor a dictionary
-/// leaves only the largest written count, a lower bound, or else `None`: the
-/// remaining signals cannot tell 4 from 100 000 distinct values.
+/// with a known value length leaves only the largest written count, a lower
+/// bound, or else `None`: the remaining signals cannot tell 4 from 100 000
+/// distinct values.
 ///
 /// The paper does not say how to combine row groups. `shared_boundaries`,
 /// evaluated only when the column gets an estimate, is set when the row groups
@@ -1592,6 +1593,7 @@ fn estimate_distinct_count_from_metadata(
     // Largest written distinct count, a lower bound of the result
     let mut max_written: Option<u64> = None;
     // A row group with values but neither a written count nor a dictionary
+    // with a known value length
     let mut missing_dictionary = false;
     for chunk in &chunks {
         let values = u64::try_from(chunk.num_values()).ok()?;
@@ -1636,7 +1638,7 @@ fn estimate_distinct_count_from_metadata(
                     missing_dictionary = true;
                     continue;
                 };
-                length.max(0.0) + BYTE_ARRAY_LENGTH_PREFIX_BYTES
+                length + BYTE_ARRAY_LENGTH_PREFIX_BYTES
             }
             PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 f64::from(chunk.column_descr().type_length())
@@ -1789,8 +1791,8 @@ fn estimate_distinct_count_from_metadata(
 /// fixed framing of the codec container, which only matters for dictionaries
 /// of a few values. GZIP has a 10 byte header and an 8 byte trailer, a ZSTD
 /// frame a 4 byte magic number, a 2 byte frame header and a 3 byte block
-/// header, the framed LZ4 format two 4 byte lengths. Raw snappy, LZ4_RAW and
-/// brotli add a byte or two, which is ignored.
+/// header, and the Hadoop framing of `LZ4` two 4 byte lengths. Raw snappy,
+/// LZ4_RAW and brotli add a byte or two, which is ignored.
 fn dictionary_page_overhead_bytes(codec: Compression) -> i64 {
     let framing = match codec {
         Compression::GZIP(_) => 18,
@@ -3177,6 +3179,8 @@ mod tests {
             );
         }
 
+        /// The row groups of a sorted column are disjoint whatever the file
+        /// order, and all-NULL row groups are ignored.
         #[test]
         fn test_estimate_disjoint_row_groups_in_any_order() {
             let chunks = [
@@ -3195,6 +3199,9 @@ mod tests {
             assert_eq!(inexact(estimate_int64(&chunks)), 2014);
         }
 
+        /// A column that only holds NULLs has no distinct value, so it does not
+        /// remove the estimate of a table with other files. Legacy unsigned
+        /// statistics with the minimum above the maximum give no value range.
         #[test]
         fn test_estimate_all_null_and_reversed_range() {
             let chunks = [ChunkSpec::all_null(1000), ChunkSpec::all_null(1000)];
