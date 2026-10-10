@@ -1178,6 +1178,10 @@ const NEWTON_MAX_ITERATIONS: usize = 200;
 /// [`invert_coupon_collector`].
 const NEWTON_TOLERANCE: f64 = 1e-6;
 
+/// Relative residual at which the Newton-Raphson solver of
+/// [`invert_coupon_collector`] stops.
+const NEWTON_RESIDUAL_TOLERANCE: f64 = 1e-9;
+
 /// Fraction of a row group's non-null values that must be distinct for the
 /// row group to count as nearly unique.
 const NEARLY_UNIQUE_FRACTION: f64 = 0.9;
@@ -1409,8 +1413,10 @@ fn dictionary_fill(
     }
     .min(size);
     let ndv = dictionary_size / value_length;
-    // NaN comes from corrupt sizes
-    if ndv.is_nan() || ndv < 1.0 {
+    // NaN comes from corrupt sizes. More dictionary values than non-null
+    // values means the value length is underestimated, e.g. taken from the
+    // minimum and maximum lengths
+    if ndv.is_nan() || ndv < 1.0 || ndv > non_null {
         return None;
     }
     // Index bit width writers use for that many entries
@@ -1528,6 +1534,11 @@ enum RowGroupEstimate {
 ///   the bound. With a codec that compresses the dictionary well, such as ZSTD
 ///   on strings with long common prefixes, the bound and thus the estimate can
 ///   be far below the truth.
+/// - a writer that lists `PLAIN` next to `PLAIN_DICTIONARY` without a fallback
+///   and without page encoding statistics has its compressed chunks above
+///   the dictionary limit taken for fallbacks, with at least the limit divided
+///   by the value length as estimate, e.g. 131 072 for INT64, see
+///   [`chunk_encoding`].
 /// - a compressed fallback chunk from a writer with a smaller dictionary page
 ///   size limit than the default is overestimated, by about the ratio of the
 ///   limits, and more for low cardinality columns.
@@ -1546,8 +1557,8 @@ fn estimate_distinct_count_from_metadata(
         return None;
     }
 
-    let mut distinct_mins: HashSet<&[u8]> = HashSet::new();
-    let mut distinct_maxs: HashSet<&[u8]> = HashSet::new();
+    let mut distinct_mins: HashSet<&[u8]> = HashSet::with_capacity(chunks.len());
+    let mut distinct_maxs: HashSet<&[u8]> = HashSet::with_capacity(chunks.len());
     let mut row_groups_with_stats = 0_usize;
     let mut exact_extrema = true;
     for stats in chunks.iter().filter_map(|chunk| chunk.statistics()) {
@@ -1973,6 +1984,11 @@ fn invert_coupon_collector(observed: f64, draws: f64) -> Option<f64> {
     for _ in 0..NEWTON_MAX_ITERATIONS {
         let decay = (-n / ndv).exp();
         let value = ndv * (1.0 - decay) - m;
+        // Near-unique inversions have a large root and a tiny slope, where
+        // rounding keeps the steps above the tolerance
+        if value.abs() <= NEWTON_RESIDUAL_TOLERANCE * m {
+            return Some(ndv);
+        }
         let slope = 1.0 - decay * (1.0 + n / ndv);
         if slope <= 0.0 {
             return None;
@@ -3041,7 +3057,8 @@ mod tests {
             let comment = inexact(estimates[0]);
             assert!((285_000..=300_000).contains(&comment), "{comment}");
             let sorted_fk = inexact(estimates[1]);
-            assert!((130_000..=150_000).contains(&sorted_fk), "{sorted_fk}");
+            // The linear extrapolation would give 147 630
+            assert!((130_000..=145_000).contains(&sorted_fk), "{sorted_fk}");
         }
 
         /// Row groups of 100 000 rows with a 128 KiB dictionary limit,
@@ -3100,6 +3117,17 @@ mod tests {
                 (190_000..=205_000).contains(&sorted_unique),
                 "{sorted_unique}"
             );
+        }
+
+        /// A value length underestimated from short minimums and maximums can
+        /// give more dictionary values than non-null values, which the model
+        /// rejects instead of panicking.
+        #[test]
+        fn test_dictionary_fill_rejects_more_values_than_rows() {
+            // 1 MiB of 16.5 byte values in a 2 MiB chunk of 50 000 values
+            assert!(dictionary_fill(2_097_152.0, 50_000.0, 16.5, None, false).is_none());
+            // The real 30 byte values fit
+            assert!(dictionary_fill(2_097_152.0, 50_000.0, 30.0, None, false).is_some());
         }
 
         /// Whether the row groups overlap is only computed for columns that get
