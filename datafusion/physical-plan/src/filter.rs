@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -62,12 +63,13 @@ use datafusion_common::{
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
+use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, Literal, lit,
 };
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::{collect_columns, split_disjunction};
 use datafusion_physical_expr::{
     AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
     conjunction, split_conjunction,
@@ -374,10 +376,11 @@ impl FilterExec {
         let input_num_rows = input_stats.num_rows;
         let input_total_byte_size = input_stats.total_byte_size;
 
-        // A column holding each of its values once, as a primary key or unique
-        // constraint says, matches one row per value asked for. No selectivity
-        // expresses that.
-        let match_limit = unique_match_limit(predicate, &input_stats);
+        // A column restricted to a few values matches the share of its rows
+        // that those values hold, one row per value for a column holding each
+        // value once. Interval analysis and the default selectivity do not
+        // express that.
+        let restriction = restricted_match(predicate, &input_stats);
 
         let (selectivity, num_rows, column_statistics) = if is_infeasible {
             // Contradictory predicate: no rows survive.
@@ -433,8 +436,30 @@ impl FilterExec {
             }
         };
 
-        let num_rows = match (match_limit, num_rows.get_value()) {
-            (Some(limit), Some(rows)) if *rows > limit => Precision::Inexact(limit),
+        let mut column_statistics = column_statistics;
+        let num_rows = match restriction {
+            Some(restriction)
+                if num_rows.get_value().is_none_or(|rows| {
+                    *rows > restriction.rows.get_value().copied().unwrap_or(0)
+                }) && !is_infeasible =>
+            {
+                let rows = restriction.rows;
+                if rows == Precision::Exact(0) {
+                    column_statistics.fill(empty_column_statistics());
+                } else {
+                    for column in column_statistics.iter_mut() {
+                        column.null_count = cap_at_rows(column.null_count, rows);
+                        column.distinct_count = cap_at_rows(column.distinct_count, rows);
+                    }
+                    if let Some(column) = column_statistics.get_mut(restriction.column) {
+                        column.distinct_count = cap_at_rows(
+                            Precision::Inexact(restriction.distinct_count),
+                            rows,
+                        );
+                    }
+                }
+                rows
+            }
             _ => num_rows,
         };
         let total_byte_size =
@@ -1112,32 +1137,132 @@ impl EmbeddedProjection for FilterExec {
     }
 }
 
-/// The most rows a filter can match, when it restricts a column holding each value
-/// once to a fixed set of values: one row per value.
-fn unique_match_limit(
-    predicate: &Arc<dyn PhysicalExpr>,
-    statistics: &Statistics,
-) -> Option<usize> {
-    let mut limit: Option<usize> = None;
-    for expr in split_conjunction(predicate) {
-        let Some((index, values)) = restricted_column(expr) else {
-            continue;
-        };
-        let holds_once = statistics
-            .column_statistics
-            .get(index)
-            .is_some_and(|column| holds_each_value_once(column, &statistics.num_rows));
-        if !holds_once {
-            continue;
-        }
-        limit = Some(limit.map_or(values, |limit: usize| limit.min(values)));
-    }
-    limit
+/// The rows a conjunct of a filter matches by restricting a column to a few
+/// values, see [`restricted_match`]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RestrictedMatch {
+    /// The rows that match
+    rows: Precision<usize>,
+    /// The restricted column
+    column: usize,
+    /// The distinct values of the column that match
+    distinct_count: usize,
 }
 
-/// The column an expression restricts to a fixed set of values, and how many values
-/// that is. NULL is never one of them: it matches nothing.
-fn restricted_column(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, usize)> {
+/// The fewest rows that a conjunct of `predicate` restricting a column to a
+/// fixed set of values matches, see [`restricted_match_estimate`].
+fn restricted_match(
+    predicate: &Arc<dyn PhysicalExpr>,
+    statistics: &Statistics,
+) -> Option<RestrictedMatch> {
+    split_conjunction(predicate)
+        .into_iter()
+        .filter_map(|expr| {
+            let (column, values) = restricted_column(expr)?;
+            let stats = statistics.column_statistics.get(column)?;
+            restricted_match_estimate(&values, stats, &statistics.num_rows).map(
+                |(rows, distinct_count)| RestrictedMatch {
+                    rows,
+                    column,
+                    distinct_count,
+                },
+            )
+        })
+        .min_by_key(|restriction| restriction.rows.get_value().copied().unwrap_or(0))
+}
+
+/// The rows of a column that hold one of `values`, and how many of the
+/// values the column can hold.
+///
+/// A value outside the column's `[min, max]` matches nothing. The other `k`
+/// values match `k / ndv` of the non-null rows, the System R uniformity
+/// assumption, which is one row per value for a column holding each value
+/// once. `ndv` is the distinct count, or else the number of values between
+/// the minimum and the maximum. `None` when neither is known and some value
+/// may match.
+fn restricted_match_estimate(
+    values: &[&ScalarValue],
+    column: &ColumnStatistics,
+    num_rows: &Precision<usize>,
+) -> Option<(Precision<usize>, usize)> {
+    let min = column.min_value.get_value();
+    let max = column.max_value.get_value();
+    let within = |value: &&&ScalarValue| {
+        let value: &ScalarValue = value;
+        let below = min.is_some_and(|min| value.partial_cmp(min) == Some(Ordering::Less));
+        let above =
+            max.is_some_and(|max| value.partial_cmp(max) == Some(Ordering::Greater));
+        !below && !above
+    };
+    let matching = values.iter().filter(within).count();
+    if matching == 0 {
+        // Exact bounds prove that no row matches
+        let exact = column.min_value.is_exact() == Some(true)
+            && column.max_value.is_exact() == Some(true)
+            && values
+                .iter()
+                .all(|value| min.is_some_and(|min| value.partial_cmp(&min).is_some()));
+        let rows = if exact {
+            Precision::Exact(0)
+        } else {
+            Precision::Inexact(0)
+        };
+        return Some((rows, 0));
+    }
+    let rows = *num_rows.get_value()?;
+    let non_null =
+        rows.saturating_sub(column.null_count.get_value().copied().unwrap_or(0));
+    if holds_each_value_once(column, num_rows) {
+        return Some((Precision::Inexact(matching.min(non_null)), matching));
+    }
+    let ndv = column.distinct_count.get_value().copied().or_else(|| {
+        let (min, max) = (min?, max?);
+        Interval::try_new(min.clone(), max.clone())
+            .ok()?
+            .cardinality()
+            .and_then(|range| usize::try_from(range).ok())
+    })?;
+    if ndv == 0 {
+        return None;
+    }
+    let distinct = matching.min(ndv);
+    let share = (distinct as f64 / ndv as f64).min(1.0);
+    // Rounded up, as `Precision::with_estimated_selectivity` does
+    let matched = (non_null as f64 * share).ceil() as usize;
+    Some((
+        Precision::Inexact(matched.max(distinct.min(non_null))),
+        distinct,
+    ))
+}
+
+/// The column an expression restricts to a fixed set of values, and those
+/// values: `col = v`, `col IN (v1, ..)` and disjunctions of those on one column.
+/// NULL is never one of them: it matches nothing.
+fn restricted_column(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, Vec<&ScalarValue>)> {
+    let disjuncts = split_disjunction(expr);
+    if disjuncts.len() > 1 {
+        let mut restricted: Option<(usize, Vec<&ScalarValue>)> = None;
+        for disjunct in disjuncts {
+            let (column, values) = restricted_single(disjunct)?;
+            match &mut restricted {
+                None => restricted = Some((column, values)),
+                Some((index, all)) if *index == column => {
+                    for value in values {
+                        if !all.contains(&value) {
+                            all.push(value);
+                        }
+                    }
+                }
+                Some(_) => return None,
+            }
+        }
+        return restricted;
+    }
+    restricted_single(expr)
+}
+
+/// `col = v` or `col IN (v1, ..)`, see [`restricted_column`]
+fn restricted_single(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, Vec<&ScalarValue>)> {
     if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
         if in_list.negated() {
             return None;
@@ -1150,7 +1275,7 @@ fn restricted_column(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, usize)> {
                 values.push(value);
             }
         }
-        return Some((column.index(), values.len()));
+        return Some((column.index(), values));
     }
 
     let binary = expr.downcast_ref::<BinaryExpr>()?;
@@ -1166,7 +1291,7 @@ fn restricted_column(expr: &Arc<dyn PhysicalExpr>) -> Option<(usize, usize)> {
         _ => return None,
     };
     let value = literal.downcast_ref::<Literal>()?.value();
-    (!value.is_null()).then_some((column.index(), 1))
+    (!value.is_null()).then(|| (column.index(), vec![value]))
 }
 
 /// Whether the column has as many distinct values as it has non-null rows, so each
@@ -3137,7 +3262,7 @@ mod tests {
                 vec![Precision::Inexact(1)],
             ),
             (
-                "OR is not collapsed to NDV=1, but NDV is capped at filtered rows",
+                "OR of equalities restricts the column to its values",
                 vec![Field::new("name", DataType::Utf8, false)],
                 vec![ColumnStatistics {
                     distinct_count: Precision::Inexact(50),
@@ -3156,9 +3281,8 @@ mod tests {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
                     )),
                 )),
-                // Input NDV is 50, but the 20% default selectivity on 100 rows
-                // estimates 20 output rows, so NDV is capped at 20.
-                vec![Precision::Inexact(20)],
+                // Two of the 50 values: 2 / 50 of the 100 rows, 2 values
+                vec![Precision::Inexact(2)],
             ),
             (
                 "AND with mixed types (Utf8 + Int32)",
@@ -4464,5 +4588,106 @@ mod tests {
             Precision::Inexact(20)
         );
         Ok(())
+    }
+
+    /// The rows a column restricted to a few values matches
+    #[test]
+    fn test_restricted_match_estimate() {
+        let utf8 = |v: &str| ScalarValue::Utf8(Some(v.to_string()));
+        let int = |v: i32| ScalarValue::Int32(Some(v));
+        let rows = Precision::Exact(18_000);
+
+        // A value outside exact bounds matches nothing, strings included
+        let state = ColumnStatistics {
+            min_value: Precision::Exact(utf8("TN")),
+            max_value: Precision::Exact(utf8("TN")),
+            distinct_count: Precision::Inexact(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            restricted_match_estimate(&[&utf8("SD")], &state, &rows),
+            Some((Precision::Exact(0), 0))
+        );
+        let inexact = ColumnStatistics {
+            min_value: Precision::Inexact(utf8("TN")),
+            max_value: Precision::Inexact(utf8("TN")),
+            ..state.clone()
+        };
+        assert_eq!(
+            restricted_match_estimate(&[&utf8("SD")], &inexact, &rows),
+            Some((Precision::Inexact(0), 0))
+        );
+
+        // k of ndv values match k / ndv of the non-null rows
+        let manufact = ColumnStatistics {
+            min_value: Precision::Inexact(int(1)),
+            max_value: Precision::Inexact(int(1000)),
+            distinct_count: Precision::Inexact(1000),
+            null_count: Precision::Inexact(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            restricted_match_estimate(&[&int(4)], &manufact, &rows),
+            Some((Precision::Inexact(18), 1))
+        );
+        // Values outside the bounds do not count
+        assert_eq!(
+            restricted_match_estimate(&[&int(4), &int(2000)], &manufact, &rows),
+            Some((Precision::Inexact(18), 1))
+        );
+        // Without a distinct count, the integer range stands in
+        let range_only = ColumnStatistics {
+            distinct_count: Precision::Absent,
+            ..manufact.clone()
+        };
+        assert_eq!(
+            restricted_match_estimate(&[&int(4), &int(5)], &range_only, &rows),
+            Some((Precision::Inexact(36), 2))
+        );
+        // A column holding each value once matches one row per value
+        let key = ColumnStatistics {
+            distinct_count: Precision::Inexact(18_000),
+            max_value: Precision::Inexact(int(18_000)),
+            ..manufact.clone()
+        };
+        assert_eq!(
+            restricted_match_estimate(&[&int(4), &int(5)], &key, &rows),
+            Some((Precision::Inexact(2), 2))
+        );
+        // Neither a distinct count nor a range: unknown
+        let unknown = ColumnStatistics::new_unknown();
+        assert_eq!(
+            restricted_match_estimate(&[&utf8("a")], &unknown, &rows),
+            None
+        );
+    }
+
+    /// The shapes that restrict a column to a few values
+    #[test]
+    fn test_restricted_column() {
+        let a = || Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let b = || Arc::new(Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
+        let eq = |column: Arc<dyn PhysicalExpr>, v: i32| {
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit(v)))
+                as Arc<dyn PhysicalExpr>
+        };
+        let or = |l: Arc<dyn PhysicalExpr>, r: Arc<dyn PhysicalExpr>| {
+            Arc::new(BinaryExpr::new(l, Operator::Or, r)) as Arc<dyn PhysicalExpr>
+        };
+        let count = |expr: &Arc<dyn PhysicalExpr>| {
+            restricted_column(expr).map(|(column, values)| (column, values.len()))
+        };
+        assert_eq!(count(&eq(a(), 1)), Some((0, 1)));
+        // A disjunction of equalities on one column, duplicates once
+        assert_eq!(
+            count(&or(or(eq(a(), 1), eq(a(), 2)), eq(a(), 1))),
+            Some((0, 2))
+        );
+        // On two columns: not a restriction
+        assert_eq!(count(&or(eq(a(), 1), eq(b(), 2))), None);
+        // A disjunct that is not an equality: not a restriction
+        let gt =
+            Arc::new(BinaryExpr::new(a(), Operator::Gt, lit(5))) as Arc<dyn PhysicalExpr>;
+        assert_eq!(count(&or(eq(a(), 1), gt)), None);
     }
 }
