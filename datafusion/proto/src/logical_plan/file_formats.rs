@@ -344,6 +344,7 @@ mod parquet {
             use datafusion_common::config::TableParquetOptions;
             let mut options = TableParquetOptions::default();
             options.global.enable_rle_to_dictionary = true;
+            options.global.estimate_distinct_count_from_metadata = true;
             let original: Arc<dyn FileFormatFactory> = Arc::new(ParquetFormatFactory {
                 options: Some(options),
             });
@@ -364,6 +365,7 @@ mod parquet {
                 .expect("parquet options");
 
             assert!(decoded_options.global.enable_rle_to_dictionary);
+            assert!(decoded_options.global.estimate_distinct_count_from_metadata);
         }
     }
 }

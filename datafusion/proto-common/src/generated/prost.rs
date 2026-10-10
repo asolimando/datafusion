@@ -885,6 +885,8 @@ pub struct ParquetOptions {
     pub row_group_range_assignment: ::prost::alloc::string::String,
     #[prost(bool, tag = "40")]
     pub enable_rle_to_dictionary: bool,
+    #[prost(bool, tag = "42")]
+    pub estimate_distinct_count_from_metadata: bool,
     #[prost(string, tag = "16")]
     pub created_by: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "35")]

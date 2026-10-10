@@ -174,9 +174,15 @@ impl Display for TableScopedPath {
 /// `Statistics::column_statistics`: each column's name, data type and
 /// nullability, in order. It deliberately excludes field/schema metadata, which
 /// cannot affect statistics — including it would needlessly fragment the cache.
+///
+/// File format options that change the computed statistics are added with
+/// [`Self::with_statistics_options`], so that tables reading the same files
+/// with different options do not share cached statistics.
 #[derive(Clone, Debug)]
 pub struct SchemaFingerprint {
     columns: Vec<(String, DataType, bool)>,
+    /// See [`Self::with_statistics_options`]
+    statistics_options: Option<String>,
     /// Precomputed hash of `columns`, so hashing a key on every cache lookup is
     /// O(1) rather than O(schema width). Computed once in `from_schema` with a
     /// fixed-seed hasher so it is stable across keys; `PartialEq` still compares
@@ -195,19 +201,39 @@ impl SchemaFingerprint {
             .iter()
             .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
             .collect();
-        let mut hasher = DefaultHasher::new();
-        columns.hash(&mut hasher);
+        let hash = Self::compute_hash(&columns, None);
         Self {
             columns,
-            hash: hasher.finish(),
+            statistics_options: None,
+            hash,
         }
+    }
+
+    /// Adds the file format options that change the statistics computed for
+    /// the file, see `FileFormat::statistics_options_fingerprint` in
+    /// `datafusion-datasource`. `None` leaves the fingerprint unchanged.
+    pub fn with_statistics_options(mut self, options: Option<String>) -> Self {
+        self.hash = Self::compute_hash(&self.columns, options.as_deref());
+        self.statistics_options = options;
+        self
+    }
+
+    fn compute_hash(columns: &[(String, DataType, bool)], options: Option<&str>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        columns.hash(&mut hasher);
+        if let Some(options) = options {
+            options.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 }
 
 impl PartialEq for SchemaFingerprint {
     fn eq(&self, other: &Self) -> bool {
         // Cheap hash gate first, then an exact comparison so collisions are safe.
-        self.hash == other.hash && self.columns == other.columns
+        self.hash == other.hash
+            && self.columns == other.columns
+            && self.statistics_options == other.statistics_options
     }
 }
 
@@ -221,7 +247,7 @@ impl Hash for SchemaFingerprint {
 
 impl DFHeapSize for SchemaFingerprint {
     fn heap_size(&self, ctx: &mut DFHeapSizeCtx) -> usize {
-        self.columns.heap_size(ctx)
+        self.columns.heap_size(ctx) + self.statistics_options.heap_size(ctx)
     }
 }
 
@@ -272,5 +298,23 @@ mod schema_fingerprint_tests {
                 .with_metadata(Metadata::new().with("k", "v")),
         );
         assert_eq!(plain, schema_md, "schema metadata must be ignored");
+    }
+
+    /// Statistics options must affect the fingerprint, and no options must
+    /// leave it unchanged.
+    #[test]
+    fn fingerprint_captures_statistics_options() {
+        let fields = || vec![Field::new("id", DataType::Int64, false)];
+        let plain = fp(fields());
+        assert_eq!(plain, fp(fields()).with_statistics_options(None));
+        let estimate = fp(fields()).with_statistics_options(Some("estimate".into()));
+        assert_ne!(
+            plain, estimate,
+            "statistics options must affect the fingerprint"
+        );
+        assert_eq!(
+            estimate,
+            fp(fields()).with_statistics_options(Some("estimate".into()))
+        );
     }
 }

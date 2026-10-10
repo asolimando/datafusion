@@ -264,8 +264,10 @@ impl ListingTable {
                 .with_metadata(file_schema.metadata().clone()),
         );
 
-        let file_schema_fingerprint =
-            Arc::new(SchemaFingerprint::from_schema(&file_schema));
+        let file_schema_fingerprint = Arc::new(
+            SchemaFingerprint::from_schema(&file_schema)
+                .with_statistics_options(options.format.statistics_options_fingerprint()),
+        );
 
         let table = Self {
             table_paths: config.table_paths,

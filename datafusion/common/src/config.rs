@@ -1460,6 +1460,15 @@ config_namespace! {
         /// See <https://github.com/apache/datafusion/issues/24112>
         pub enable_rle_to_dictionary: bool, default = false
 
+        /// (reading) If true, estimate the number of distinct values of each
+        /// column from the file metadata, such as dictionary page sizes and
+        /// min/max statistics. Written per row group counts are combined with
+        /// the estimate. Columns without a dictionary usually get no estimate.
+        /// The estimate is always inexact. Like other format options, the
+        /// setting is read when a table is created, so changing it does not
+        /// affect existing tables. See <https://arxiv.org/abs/2603.24606>
+        pub estimate_distinct_count_from_metadata: bool, default = false
+
         /// (reading) Which byte range of a split file reads each row group.
         /// `start_offset` picks the range containing the row group's start.
         /// `midpoint` picks the range containing its midpoint, as Spark does,
