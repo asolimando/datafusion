@@ -1240,18 +1240,20 @@ const DICTIONARY_PAGE_SIZE_LIMIT: f64 = 1_048_576.0;
 /// estimate high by at most `nulls * 5 / value_length`.
 const DEFINITION_LEVEL_BYTES_PER_NULL: f64 = 3.0;
 
-/// Largest Thrift header of a data page. It holds the page statistics, which
-/// makes it 30 to 45 bytes for fixed width types. The top of the range is used
-/// so that the headers never inflate the number of runs, see
-/// [`invert_run_length_size`].
-const DATA_PAGE_HEADER_BYTES_MAX: f64 = 40.0;
+/// Thrift header of a data page without page statistics, as parquet-rs
+/// writes it: 18 to 23 bytes, the same as a dictionary page header
+const DATA_PAGE_HEADER_BYTES: f64 = DICTIONARY_PAGE_HEADER_BYTES as f64;
 
-/// Header of a run in the RLE / bit packing hybrid encoding, a varint of one
-/// byte for runs shorter than 64 values
-const RLE_RUN_HEADER_BYTES: f64 = 1.0;
+/// Bit width byte that starts the dictionary indexes of a data page
+const RLE_BIT_WIDTH_BYTES: f64 = 1.0;
 
-/// Length prefix of the RLE encoded indexes of a data page
-const RLE_LENGTH_PREFIX_BYTES: f64 = 4.0;
+/// Length prefix of the definition levels of a data page
+const LEVEL_LENGTH_PREFIX_BYTES: f64 = 4.0;
+
+/// Number of bytes of the unsigned varint of `value`, 7 bits per byte
+fn varint_bytes(value: u64) -> u32 {
+    (u64::BITS - value.leading_zeros()).div_ceil(7).max(1)
+}
 
 /// How the data pages of a column chunk are encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1581,6 +1583,10 @@ enum RowGroupEstimate {
 ///   the gap at the cost of a read per column chunk. For a domain of a few
 ///   values the bound itself is uncertain by the page header, about one value
 ///   of 8 bytes.
+/// - the run length model counts data page headers without page statistics,
+///   as parquet-rs writes them. Writers that store the page minimum and
+///   maximum in the headers of fixed width pages give up to 3 more values per
+///   page for `INT32`, within the page bounds.
 /// - row groups that hold disjoint parts of the same range, e.g. written by
 ///   parallel streams, are taken for samples of the same values and
 ///   underestimated, unless the distinct page minimums and maximums show
@@ -1768,18 +1774,32 @@ fn estimate_distinct_count_from_metadata(
                 // The size is below what bit packed indexes take, so the
                 // indexes are run length encoded. When the pages are sorted,
                 // each distinct value is one run
-                let estimate =
-                    match sorted_page_count(page_index, row_group, parquet_idx, chunk) {
-                        Some(pages) if !solved => {
-                            let page_bytes = pages as f64
-                                * (DATA_PAGE_HEADER_BYTES_MAX + RLE_LENGTH_PREFIX_BYTES);
-                            invert_run_length_size(
-                                (size - page_bytes).max(0.0),
-                                value_length,
-                            )
-                        }
-                        _ => estimate,
-                    };
+                let page_bytes = (!solved)
+                    .then(|| sorted_page_bytes(page_index, row_group, parquet_idx, chunk))
+                    .flatten();
+                let estimate = match page_bytes {
+                    Some(pages) => {
+                        // The levels of a page of NULLs are one run, counted
+                        // with the page
+                        let nulls =
+                            nulls.unwrap_or(0).saturating_sub(pages.null_page_values);
+                        let levels_outside_null_pages = definition_level_bytes(
+                            chunk,
+                            nulls,
+                            values.saturating_sub(pages.null_page_values),
+                        );
+                        invert_run_length_size(
+                            (chunk.uncompressed_size() as f64
+                                - DICTIONARY_PAGE_HEADER_BYTES as f64
+                                - levels_outside_null_pages
+                                - pages.bytes)
+                                .max(0.0),
+                            non_null,
+                            value_length,
+                        )
+                    }
+                    None => estimate,
+                };
                 estimate.max(lower_bound.unwrap_or(0.0))
             }
         };
@@ -2009,10 +2029,12 @@ fn disjoint_row_groups_shared_boundaries(
 /// form for each `b` in turn. When the size falls in the jump at a power of
 /// two, the result is that power of two. The result is in `[1, non_null]`.
 ///
-/// The returned flag tells whether the result solves the equation. It does
-/// not when the size is below what the model gives for the result, which
-/// means that the indexes take fewer bits than bit packing, i.e. they are run
-/// length encoded, see [`invert_run_length_size`].
+/// The returned flag tells whether the size is explained by bit packed
+/// indexes. It is not when the size is below what the model gives for the
+/// result, which means that the indexes take fewer bits than bit packing, i.e.
+/// they are run length encoded, see [`invert_run_length_size`]. A size above
+/// the model for `non_null` distinct values is explained by values that are
+/// all distinct.
 fn invert_dictionary_size(size: f64, non_null: f64, value_length: f64) -> (f64, bool) {
     let upper = non_null.max(1.0);
     if value_length >= size {
@@ -2027,11 +2049,11 @@ fn invert_dictionary_size(size: f64, non_null: f64, value_length: f64) -> (f64, 
             return (low.min(upper), false);
         }
         if ndv <= high || high >= upper {
-            return (ndv.min(upper), ndv <= upper);
+            return (ndv.min(upper), true);
         }
         low = high;
     }
-    (upper, false)
+    (upper, true)
 }
 
 /// Invert the size of a dictionary encoded column chunk whose indexes are run
@@ -2039,23 +2061,36 @@ fn invert_dictionary_size(size: f64, non_null: f64, value_length: f64) -> (f64, 
 ///
 /// `size` is the uncompressed chunk size without the page headers, the
 /// definition levels and the length prefixes of the index streams. It is
-/// modeled as the dictionary plus one run per distinct value, a one byte
-/// header and the index in whole bytes:
+/// modeled as the dictionary plus one run per distinct value, a header and the
+/// index in whole bytes:
 ///
-/// `size = ndv * (value_length + 1 + ceil(ceil(log2(ndv)) / 8))`
+/// `size = ndv * (value_length + header + ceil(ceil(log2(ndv)) / 8))`
 ///
 /// solved for each index bit width in turn as [`invert_dictionary_size`]
-/// does. The result is at least 1.
-fn invert_run_length_size(size: f64, value_length: f64) -> f64 {
+/// does. The header is the varint of twice the run length, whose size depends
+/// on the solution: the result is the first solution whose mean run of
+/// `non_null / ndv` values fits the header. The result is at least 1.
+fn invert_run_length_size(size: f64, non_null: f64, value_length: f64) -> f64 {
+    let solve = |header_bytes: u32| {
+        let mut ndv = 1.0;
+        for bit_width in 1..=64 {
+            let run_bytes = f64::from(header_bytes) + (f64::from(bit_width) / 8.0).ceil();
+            ndv = size / (value_length + run_bytes);
+            if ndv <= 2.0_f64.powi(bit_width) {
+                break;
+            }
+        }
+        ndv.max(1.0)
+    };
     let mut ndv = 1.0;
-    for bit_width in 1..=64 {
-        let run_bytes = RLE_RUN_HEADER_BYTES + (f64::from(bit_width) / 8.0).ceil();
-        ndv = size / (value_length + run_bytes);
-        if ndv <= 2.0_f64.powi(bit_width) {
+    for header_bytes in 1..=10 {
+        ndv = solve(header_bytes);
+        let mean_run = (non_null / ndv).round() as u64;
+        if varint_bytes(mean_run.saturating_mul(2)) <= header_bytes {
             break;
         }
     }
-    ndv.max(1.0)
+    ndv
 }
 
 /// A page minimum or maximum from the column index, ordered as the column
@@ -2153,20 +2188,71 @@ fn page_sorted(index: &ColumnIndexMetaData, sort_order: SortOrder) -> bool {
         })
 }
 
-/// The number of data pages of a column chunk whose column index proves its
-/// values sorted, see [`page_sorted`]
-fn sorted_page_count(
+/// For a column chunk whose column index proves its values sorted, see
+/// [`page_sorted`], the bytes its data pages take besides the dictionary
+/// indexes and the NULLs: per page the header, the bit width of the indexes
+/// and, for a nullable column, the length prefix and the run of its
+/// definition levels. Byte array minimums and maximums, which some writers
+/// store in the page headers, are counted too, so that they do not inflate
+/// the number of runs.
+fn sorted_page_bytes(
     page_index: Option<&dyn PageIndexProvider>,
     row_group: usize,
     parquet_idx: usize,
     chunk: &ColumnChunkMetaData,
-) -> Option<usize> {
+) -> Option<SortedPages> {
     let page_index = page_index?;
     let index = page_index.column_index(row_group, parquet_idx)?;
-    page_sorted(index, chunk.column_descr().sort_order())
-        .then(|| page_index.offset_index(row_group, parquet_idx))
-        .flatten()
-        .map(|offsets| offsets.page_locations().len())
+    if !page_sorted(index, chunk.column_descr().sort_order()) {
+        return None;
+    }
+    let locations = page_index
+        .offset_index(row_group, parquet_idx)?
+        .page_locations();
+    let nullable = chunk.column_descr().max_def_level() > 0;
+    let values = chunk.num_values();
+    let mut page_bytes = 0.0;
+    let mut null_page_values = 0_u64;
+    for (page, location) in locations.iter().enumerate() {
+        let end = locations
+            .get(page + 1)
+            .map_or(values, |next| next.first_row_index);
+        let rows = u64::try_from(end - location.first_row_index).unwrap_or(0);
+        if page < index.num_pages() as usize && index.is_null_page(page) {
+            null_page_values += rows;
+        }
+        let level_bytes = if nullable {
+            // One run of definition levels, a varint header and the level
+            LEVEL_LENGTH_PREFIX_BYTES
+                + f64::from(varint_bytes(rows.saturating_mul(2)))
+                + 1.0
+        } else {
+            0.0
+        };
+        page_bytes += DATA_PAGE_HEADER_BYTES + RLE_BIT_WIDTH_BYTES + level_bytes;
+    }
+    let statistics_bytes: usize = match index {
+        ColumnIndexMetaData::BYTE_ARRAY(index)
+        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index) => index
+            .min_values_iter()
+            .chain(index.max_values_iter())
+            .map(|value| value.map_or(0, <[u8]>::len))
+            .sum(),
+        _ => 0,
+    };
+    Some(SortedPages {
+        bytes: page_bytes + statistics_bytes as f64,
+        null_page_values,
+    })
+}
+
+/// The data pages of a column chunk whose values are sorted, see
+/// [`sorted_page_bytes`]
+struct SortedPages {
+    /// The bytes of the pages besides the indexes and the NULLs
+    bytes: f64,
+    /// The number of values in pages that only hold NULLs
+    null_page_values: u64,
 }
 
 /// The bounds of the distinct count that the column index proves, see
@@ -2743,7 +2829,7 @@ mod tests {
 
             // The estimate stays within [1, non_null]
             assert_eq!(invert_dictionary_size(1.0, 100.0, 8.0), (1.0, false));
-            assert_eq!(invert_dictionary_size(1e9, 100.0, 8.0), (100.0, false));
+            assert_eq!(invert_dictionary_size(1e9, 100.0, 8.0), (100.0, true));
             // Below the size of 2 values with 1 bit indexes: run length encoded
             assert_eq!(invert_dictionary_size(17.0, 100.0, 8.0), (1.0, false));
             // In the jump at 4 values: run length encoded
@@ -3058,7 +3144,7 @@ mod tests {
             let with_index = inexact(
                 estimate_row_groups(std::slice::from_ref(&sorted), props(), true)[0],
             );
-            assert!((199..=203).contains(&with_index), "{with_index}");
+            assert!((195..=203).contains(&with_index), "{with_index}");
             // Without the page index nothing proves the values sorted: only
             // the compressed dictionary page bound remains
             let without_index =
@@ -3087,6 +3173,54 @@ mod tests {
                 estimate_row_groups(&[cycling], props(), false)[0]
             );
             assert_eq!(with_index, Precision::Inexact(12));
+        }
+
+        /// Sorted values whose range is far wider than their count, so that
+        /// neither the range nor the page ranges cap the run length model:
+        /// 201 years 7 apart, ascending and descending, and with NULLs filling
+        /// whole pages
+        #[test]
+        fn test_estimate_sorted_wide_range() {
+            let props = || {
+                WriterProperties::builder()
+                    .set_compression(zstd())
+                    .set_data_page_row_count_limit(20_000)
+                    .build()
+            };
+            let years = |i: i32| 1900 + 7 * (i / 365);
+            let ascending = int32_batch((0..73_049).map(years));
+            let estimate = inexact(estimate_row_groups(&[ascending], props(), true)[0]);
+            assert!((195..=207).contains(&estimate), "ascending {estimate}");
+            let descending = int32_batch((0..73_049).rev().map(years));
+            let estimate = inexact(estimate_row_groups(&[descending], props(), true)[0]);
+            assert!((195..=207).contains(&estimate), "descending {estimate}");
+
+            let array: ArrayRef = Arc::new(Int32Array::from_iter(
+                (0..73_049 + 40_960).map(|i| (i >= 40_960).then(|| years(i - 40_960))),
+            ));
+            let with_nulls = RecordBatch::try_from_iter([("v", array)]).unwrap();
+            let estimate = inexact(estimate_row_groups(&[with_nulls], props(), true)[0]);
+            assert!(
+                (195..=207).contains(&estimate),
+                "with null pages {estimate}"
+            );
+        }
+
+        /// A sorted key spread over pages of the same index bit width: the
+        /// size is that of bit packed unique values, so the run length model
+        /// does not apply and the estimate is a key
+        #[test]
+        fn test_estimate_sorted_unique() {
+            let array: ArrayRef = Arc::new(Int64Array::from_iter_values(0..25_000));
+            let batch = RecordBatch::try_from_iter([("v", array)]).unwrap();
+            let props = WriterProperties::builder()
+                .set_compression(zstd())
+                .set_data_page_row_count_limit(20_000)
+                .build();
+            assert_eq!(
+                estimate_row_groups(&[batch], props, true)[0],
+                Precision::Inexact(25_000)
+            );
         }
 
         /// 12 row groups that each hold every 12th of 261 values, with the rows
