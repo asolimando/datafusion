@@ -589,7 +589,9 @@ impl<'a> DFParquetMetadata<'a> {
         let mut has_statistics = false;
         let mut num_rows = 0_usize;
         for row_group_meta in row_groups_metadata {
-            num_rows += row_group_meta.num_rows() as usize;
+            // A negative row count in a corrupt footer must not overflow
+            num_rows = num_rows
+                .saturating_add(usize::try_from(row_group_meta.num_rows()).unwrap_or(0));
 
             if !has_statistics {
                 has_statistics = row_group_meta
@@ -1047,18 +1049,22 @@ fn compute_arrow_column_size(
     num_rows: usize,
 ) -> Precision<usize> {
     // For primitive types with known fixed size, compute exact size
+    // Footer values may be corrupt, so overflow gives an unknown size
     if let Some(byte_width) = data_type.primitive_width() {
-        return Precision::Exact(byte_width * num_rows);
+        return byte_width
+            .checked_mul(num_rows)
+            .map_or(Precision::Absent, Precision::Exact);
     }
 
     // Use the uncompressed Parquet size as an estimate for other types
     if let Some(parquet_idx) = parquet_idx {
-        let uncompressed_bytes: i64 = row_groups_metadata
+        let uncompressed_bytes = row_groups_metadata
             .iter()
             .filter_map(|rg| rg.columns().get(parquet_idx))
-            .map(|col| col.uncompressed_size())
-            .sum();
-        return Precision::Inexact(uncompressed_bytes as usize);
+            .try_fold(0_usize, |total, col| {
+                total.checked_add(usize::try_from(col.uncompressed_size()).ok()?)
+            });
+        return uncompressed_bytes.map_or(Precision::Absent, Precision::Inexact);
     }
 
     // Otherwise, we cannot determine the size
@@ -1922,6 +1928,38 @@ mod tests {
                     assert_eq!(stats.num_rows, Precision::Exact((3 + rows) as usize));
                 }
             }
+        }
+
+        /// Corrupt row counts in the footer neither panic nor overflow
+        #[test]
+        fn test_statistics_with_corrupt_row_counts() {
+            let schema_descr = create_schema_descr(1);
+            let arrow_schema = create_arrow_schema(1);
+            let statistics = |row_counts: &[i64]| {
+                let row_groups = row_counts
+                    .iter()
+                    .map(|rows| {
+                        create_row_group_with_stats(&schema_descr, vec![None], *rows)
+                    })
+                    .collect();
+                let metadata =
+                    create_parquet_metadata(Arc::clone(&schema_descr), row_groups);
+                DFParquetMetadata::statistics_from_parquet_metadata(
+                    &metadata,
+                    &arrow_schema,
+                )
+                .unwrap()
+            };
+            // A negative row count counts as zero
+            let negative = statistics(&[-1, 10]);
+            assert_eq!(negative.num_rows, Precision::Exact(10));
+            assert_eq!(
+                negative.column_statistics[0].byte_size,
+                Precision::Exact(40)
+            );
+            // A byte size that overflows is unknown
+            let huge = statistics(&[i64::MAX]);
+            assert_eq!(huge.column_statistics[0].byte_size, Precision::Absent);
         }
 
         #[test]
