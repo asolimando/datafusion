@@ -902,11 +902,13 @@ fn summarize_column_statistics(
     accumulators.null_counts_array[logical_schema_index] =
         summarize_null_counts(stats_converter, row_groups_metadata)?;
 
-    accumulators.distinct_counts_array[logical_schema_index] =
-        summarize_distinct_counts(parquet_index, row_groups_metadata);
+    let written_count = summarize_distinct_counts(parquet_index, row_groups_metadata);
+    accumulators.distinct_counts_array[logical_schema_index] = written_count;
 
+    // An exact written count stands. An inexact one is the maximum over row
+    // groups, which the estimate refines with the row group ranges.
     if estimate_distinct_count
-        && accumulators.distinct_counts_array[logical_schema_index] == Precision::Absent
+        && written_count.is_exact() != Some(true)
         && let Some(parquet_index) = parquet_index
     {
         let min = accumulators.min_accs[logical_schema_index]
@@ -932,11 +934,14 @@ fn summarize_column_statistics(
                     })
                 })
                 .collect();
+            // A comparison kernel missing for the type must not drop the
+            // other statistics of the column
             disjoint_row_groups_shared_boundaries(
                 &stats_converter.row_group_mins(row_groups_metadata)?,
                 &stats_converter.row_group_maxes(row_groups_metadata)?,
                 &skip,
-            )?
+            )
+            .unwrap_or(None)
         } else {
             None
         };
@@ -949,6 +954,10 @@ fn summarize_column_statistics(
             row_groups_metadata,
             &facts,
         ) {
+            let estimate = match written_count {
+                Precision::Inexact(written) => estimate.max(written),
+                _ => estimate,
+            };
             accumulators.distinct_counts_array[logical_schema_index] =
                 Precision::Inexact(estimate);
         }
@@ -1514,7 +1523,13 @@ fn estimate_distinct_count_from_metadata(
             // dictionary, and how many rows those are depends on the writer:
             // parquet-rs writes the rows buffered when the dictionary fills
             // without it. Only the lower bound is reliable.
-            _ => lower_bound?,
+            _ => match lower_bound {
+                Some(lower_bound) => lower_bound,
+                None => {
+                    missing_dictionary = true;
+                    continue;
+                }
+            },
         };
         row_group_estimates.push((estimate.clamp(1.0, non_null), non_null));
     }
@@ -2789,6 +2804,37 @@ mod tests {
             assert_eq!(inexact(estimate_int64(&chunks)), 5000);
             let chunks = [ChunkSpec::plain(10_000, 0, 100_000)];
             assert_eq!(estimate_int64(&chunks), Precision::Absent);
+        }
+
+        /// Written counts in every row group give the maximum over row groups,
+        /// which the ranges of a sorted column refine to the sum.
+        #[test]
+        fn test_estimate_refines_written_distinct_counts() {
+            let mut chunks = [
+                ChunkSpec::dictionary(10_000, 5000, 0, 9999),
+                ChunkSpec::dictionary(10_000, 5000, 10_000, 19_999),
+                ChunkSpec::dictionary(10_000, 5000, 20_000, 29_999),
+            ];
+            for chunk in &mut chunks {
+                chunk.distinct = Some(5000);
+            }
+            let metadata = int64_metadata(&chunks);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )]));
+            let written =
+                DFParquetMetadata::statistics_from_parquet_metadata(&metadata, &schema)
+                    .unwrap()
+                    .column_statistics[0]
+                    .distinct_count;
+            assert_eq!(written, Precision::Inexact(5000));
+            assert_eq!(estimate_int64(&chunks), Precision::Inexact(15_000));
+
+            // A single row group has an exact count, which stands
+            let exact = [chunks[0].clone()];
+            assert_eq!(estimate_int64(&exact), Precision::Exact(5000));
         }
 
         /// NULLs are only subtracted where they are known, and an estimate is
