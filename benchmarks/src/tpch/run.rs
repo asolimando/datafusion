@@ -136,7 +136,7 @@ impl RunOpt {
         config.options_mut().execution.hash_join_buffering_capacity =
             self.hash_join_buffering_capacity;
         let rt = self.common.build_runtime()?;
-        let ctx = SessionContext::new_with_config_rt(config, rt);
+        let ctx = self.common.build_context(config, rt)?;
         benchmark_run.set_memory_pool(&ctx.runtime_env().memory_pool);
         // register tables
         self.register_tables(&ctx).await?;
@@ -265,7 +265,17 @@ impl RunOpt {
         if debug {
             println!(
                 "=== Physical plan with metrics ===\n{}\n",
-                DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
+                {
+                        let mut display =
+                            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref());
+                        if self.common.show_statistics {
+                            display = display.set_show_statistics(true);
+                            if let Some(registry) = state.statistics_registry() {
+                                display = display.set_statistics_registry(registry.clone());
+                            }
+                        }
+                        display
+                    }
                     .indent(true)
             );
             if !result.is_empty() {
@@ -343,7 +353,11 @@ impl RunOpt {
             .with_schema(schema);
 
         let provider = ListingTable::try_new(config)?
-            .with_constraints(constraints)
+            .with_constraints(if self.common.no_constraints {
+                Default::default()
+            } else {
+                constraints
+            })
             .with_cache(ctx.runtime_env().cache_manager.get_file_statistic_cache());
 
         Ok(Arc::new(provider))

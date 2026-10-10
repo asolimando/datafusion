@@ -73,9 +73,44 @@ pub struct CommonOpt {
     /// Adds random latency in the range 20-200ms to each object store operation.
     #[arg(long = "simulate-latency", env)]
     pub simulate_latency: bool,
+
+    /// Harness: plan with true per-column distinct counts (JSON truth file)
+    #[arg(long = "ndv-oracle")]
+    pub ndv_oracle: Option<std::path::PathBuf>,
+
+    /// Harness: register the deprecated bundled statistics providers
+    #[arg(long = "builtin-providers")]
+    pub builtin_providers: bool,
+
+    /// Harness: with --debug, print the plan with metrics and statistics
+    #[arg(long = "show-statistics")]
+    pub show_statistics: bool,
+
+    /// Harness: do not declare primary keys (like register_parquet)
+    #[arg(long = "no-constraints")]
+    pub no_constraints: bool,
 }
 
 impl CommonOpt {
+    /// Harness: a context with the statistics registry of the harness options
+    pub fn build_context(
+        &self,
+        config: SessionConfig,
+        rt: Arc<RuntimeEnv>,
+    ) -> Result<datafusion::prelude::SessionContext> {
+        let registry = super::ndv_oracle::harness_registry(
+            self.ndv_oracle.as_deref(),
+            self.builtin_providers,
+        )?;
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(rt)
+            .with_default_features()
+            .with_statistics_registry(registry)
+            .build();
+        Ok(datafusion::prelude::SessionContext::new_with_state(state))
+    }
+
     /// Return an appropriately configured `SessionConfig`
     pub fn config(&self) -> Result<SessionConfig> {
         SessionConfig::from_env().map(|config| self.update_config(config))

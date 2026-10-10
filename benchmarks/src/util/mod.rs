@@ -18,6 +18,7 @@
 //! Shared benchmark utilities
 pub mod latency_object_store;
 mod memory;
+pub mod ndv_oracle;
 mod options;
 mod run;
 
