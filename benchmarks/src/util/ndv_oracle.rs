@@ -27,12 +27,16 @@ use datafusion::physical_plan::operator_statistics::{
 };
 use datafusion::physical_plan::statistics::StatisticsArgs;
 
-/// Truth file: {"table.column": ndv} or {"table": {"column": ndv}}. Column names
-/// must be unique across tables.
+/// Truth file, see `benchmarks/ndv_oracle/README.md`: `{"benchmark", "scale_factor",
+/// "generator", "ndv": {"table": {"column": ndv}}}`, or the bare `{"table": {"column":
+/// ndv}}` / `{"table.column": ndv}`. Column names must be unique across tables.
 pub fn load_truth(path: &Path) -> Result<HashMap<String, usize>> {
     let text = std::fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&text)
+    let mut value: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
+    if let Some(ndv) = value.get_mut("ndv") {
+        value = ndv.take();
+    }
     let mut out = HashMap::new();
     let mut insert = |col: &str, ndv: u64| -> Result<()> {
         if out.insert(col.to_string(), ndv as usize).is_some() {

@@ -931,6 +931,10 @@ mod tests {
             sort_spill_reservation_bytes: None,
             debug: false,
             simulate_latency: false,
+            ndv_oracle: None,
+            builtin_providers: false,
+            show_statistics: false,
+            no_constraints: false,
         }
     }
 

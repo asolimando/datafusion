@@ -266,17 +266,17 @@ impl RunOpt {
             println!(
                 "=== Physical plan with metrics ===\n{}\n",
                 {
-                        let mut display =
-                            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref());
-                        if self.common.show_statistics {
-                            display = display.set_show_statistics(true);
-                            if let Some(registry) = state.statistics_registry() {
-                                display = display.set_statistics_registry(registry.clone());
-                            }
+                    let mut display =
+                        DisplayableExecutionPlan::with_metrics(physical_plan.as_ref());
+                    if self.common.show_statistics {
+                        display = display.set_show_statistics(true);
+                        if let Some(registry) = state.statistics_registry() {
+                            display = display.set_statistics_registry(registry.clone());
                         }
-                        display
                     }
-                    .indent(true)
+                    display
+                }
+                .indent(true)
             );
             if !result.is_empty() {
                 // do not call print_batches if there are no batches as the result is confusing
