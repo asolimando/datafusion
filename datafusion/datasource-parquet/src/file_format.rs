@@ -491,6 +491,9 @@ impl FileFormat for ParquetFormat {
             .with_metadata_size_hint(self.metadata_size_hint())
             .with_decryption_properties(file_decryption_properties)
             .with_file_metadata_cache(Some(file_metadata_cache))
+            .with_estimate_distinct_count(
+                self.options.global.estimate_distinct_count_from_metadata,
+            )
             .fetch_statistics(&table_schema)
             .await
     }
@@ -534,10 +537,12 @@ impl FileFormat for ParquetFormat {
             .with_file_metadata_cache(Some(file_metadata_cache))
             .fetch_metadata()
             .await?;
-        let statistics = DFParquetMetadata::statistics_from_parquet_metadata(
-            &metadata,
-            &table_schema,
-        )?;
+        let statistics =
+            DFParquetMetadata::statistics_from_parquet_metadata_with_options(
+                &metadata,
+                &table_schema,
+                self.options.global.estimate_distinct_count_from_metadata,
+            )?;
         let ordering =
             crate::metadata::ordering_from_parquet_metadata(&metadata, &table_schema)?;
         Ok(
