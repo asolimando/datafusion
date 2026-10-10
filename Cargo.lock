@@ -1801,6 +1801,7 @@ dependencies = [
  "tempfile",
  "test-utils",
  "tokio",
+ "tpchgen",
  "unicode-width 0.2.2",
  "url",
  "uuid",
@@ -6703,6 +6704,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tpchgen"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e26c6d047694183517044ea72d2e0337b05b43d40809f0958f603a7e5a286855"
 
 [[package]]
 name = "tracing"
